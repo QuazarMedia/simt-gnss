@@ -1,14 +1,17 @@
 ---
 name: gnss-engine
-description: Navigate and extend the standalone SIMT GNSS engine library (simt-gnss) - :gnss-core pure-JVM parsers/solvers/filters/corrections/orbit, and :gnss-android (the processor plus the public SimtGnssEngine facade). Use for any task mentioning GNSS, RTK, PPP, RTCM, SBAS, NTRIP, ephemeris, pseudorange, carrier phase, ionosphere/troposphere, Klobuchar, satellite constellations, raw GnssMeasurement processing, or the simt-gnss repository itself.
+description: Navigate and extend the simt-gnss GNSS engine library (app.simt:gnss-core / app.simt:gnss-android) - pure-JVM parsers, solvers, filters, corrections and orbit computation, plus the Android GnssMeasurementProcessor and its public SimtGnssEngine facade. Use for any task mentioning GNSS, RTK, PPP, RTCM, SBAS, NTRIP, ephemeris, pseudorange, carrier phase, ionosphere/troposphere, Klobuchar, satellite constellations, or raw GnssMeasurement processing.
 ---
 
-# SIMT GNSS engine library (`simt-gnss`)
+# simt-gnss — GNSS engine library
 
-The GNSS processing pipeline that used to live in `simt-app/feature/gnss` now ships as a
-standalone library so any Android app can use it as an alternative to RTKLIB. It is
-physics-heavy and review-hardened (56+ tracked fixes) — **do not "simplify" formulas,
-constants, or gating logic**; verify changes against the relevant ICD and the design docs.
+A Kotlin GNSS processing engine for Android, packaged as two modules. It turns raw Android GNSS
+observations into positions: broadcast-ephemeris decoding, satellite orbit/clock computation,
+atmospheric and RTK/PPP corrections, carrier smoothing, and weighted least-squares positioning.
+It is physics-heavy and review-hardened — **do not "simplify" formulas, constants, or gating
+logic**; verify changes against the relevant ICD.
+
+The library holds no host-application code: no DI framework, no UI toolkit, no Play Services.
 
 ## Modules
 
@@ -42,7 +45,7 @@ constants, or gating logic**; verify changes against the relevant ICD and the de
 | `ProcessedMeasurements.kt`, `SmoothingMode.kt` | Public neutral types (`measurements` + `gpsTimeNanos`; `CARRIER_HATCH` / `DOPPLER`) |
 | `AndroidGnssPlatform.kt` | Installs the Android backends into `GnssPlatform` (`SystemClock.elapsedRealtime()`, a `android.util.Log`-backed logger) |
 
-Data flow: platform callbacks (`GnssMeasurementsEvent`, `GnssNavigationMessage`, `GnssStatus`) → quality gates (C/N0, elevation) → Hatch/Doppler smoothing → dual-freq IF combination when L1+L5 → per-iteration corrections (sat pos+clock, earth rotation, tropo, iono, Sagnac, relativistic) → iterated WLS with per-constellation clock states (ISB) → RAIM outlier rejection → covariance/DOP → inter-epoch Kalman → fix acceptance gate (consumer concern — the `gnss-integration` skill in `simt-app`).
+Data flow: platform callbacks (`GnssMeasurementsEvent`, `GnssNavigationMessage`, `GnssStatus`) → quality gates (C/N0, elevation) → Hatch/Doppler smoothing → dual-freq IF combination when L1+L5 → per-iteration corrections (sat pos+clock, earth rotation, tropo, iono, Sagnac, relativistic) → iterated WLS with per-constellation clock states (ISB) → RAIM outlier rejection → covariance/DOP → inter-epoch Kalman. The fix acceptance gate is consumer policy — the library returns a solution, the app decides whether to use it.
 
 ## Neutral seams — the rule that keeps `:gnss-core` pure
 
@@ -80,9 +83,10 @@ Cross-module API that must stay `public` (used by consumers): `RawGnssPositionCo
 - **Half-cycle / slip**: phase observations gated on half-cycle ambiguity flags; Hatch filter resets on detected slips — preserve these gates when touching smoothing.
 - **Threading**: callbacks arrive on arbitrary threads; processor state is instance-locked and consumers serialize epochs. Keep new state inside the existing locking discipline.
 
-## Governance docs (they live in `simt-app`)
+## Review-hardened history
 
-- `docs/feature-plans/gnss/GNSS_FEATURE_PLAN.md` — model formulation, roadmap, **traceability matrix (§10) — update it when adding symbols**
-- `docs/feature-plans/gnss/GNSS_CODE_REVIEW.md` — past findings with rationale; check before re-introducing a rejected idea (e.g. post-solve integer ambiguity rounding was deliberately removed)
+The engine carries a long record of reviewed fixes. Before re-introducing an approach that was
+previously rejected, check the git history and the issue tracker — post-solve integer ambiguity
+rounding, for example, was deliberately removed. When you fix a defect, state the formula,
+constant or gate you changed and why in the commit message, and add it to `CHANGELOG.md`.
 
-When you fix a defect here, record it in `GNSS_CODE_REVIEW.md` following the existing numbered format.
