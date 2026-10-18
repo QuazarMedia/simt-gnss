@@ -43,7 +43,8 @@ First public release.
   imports.
 - Published to Maven Central as `app.simt:gnss-core` and `app.simt:gnss-android`, with sources
   and javadoc artifacts, signed.
-- CI: a build/test workflow and a tag-driven Maven Central release workflow.
+- CI: a build/test workflow and a tag-driven Maven Central release workflow that creates the
+  matching GitHub release once the upload succeeds.
 
 [Unreleased]: https://github.com/QuazarMedia/simt-gnss/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/QuazarMedia/simt-gnss/releases/tag/v0.1.0

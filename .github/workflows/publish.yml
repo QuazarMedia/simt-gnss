@@ -73,3 +73,52 @@ jobs:
           ORG_GRADLE_PROJECT_signingKey: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.SIGNING_PASSWORD }}
         run: ./gradlew publishAggregationToCentralPortal -PVERSION_NAME="${{ steps.version.outputs.value }}" --stacktrace
+
+  release:
+    name: create GitHub release
+    # A tag push is the only thing that names a release a tag can point at; a
+    # workflow_dispatch run publishes a version that may have no tag at all.
+    if: github.event_name == 'push'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::The release for $TAG already exists; leaving it untouched."
+            exit 0
+          fi
+
+          # The body is this version's CHANGELOG section, so the release notes and
+          # the changelog cannot drift apart. A tag cut before its section was
+          # written degrades to the Maven Central line alone rather than failing.
+          notes="$(awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && (/^## / || /^\[/) { exit }
+            found && NF == 0 && !started { next }
+            found { started = 1; print }
+          ' CHANGELOG.md)"
+
+          {
+            if [ -n "$notes" ]; then
+              printf '%s\n\n' "$notes"
+            fi
+            printf 'Published to Maven Central as `app.simt:gnss-core:%s` and `app.simt:gnss-android:%s`.\n' "$version" "$version"
+          } > release-notes.md
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --verify-tag \
+            --notes-file release-notes.md

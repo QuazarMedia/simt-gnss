@@ -132,8 +132,9 @@ Releases are published to Maven Central from CI: pushing a version tag (for exam
 runs the release workflow, which uploads both modules and derives the version from the tag.
 Every artifact is signed and ships with its sources and javadoc.
 
-Release notes live in [CHANGELOG.md](CHANGELOG.md). To exercise the publications locally without
-publishing, run `./gradlew publishToMavenLocal`.
+Release notes live in [CHANGELOG.md](CHANGELOG.md). Once the upload succeeds, the same workflow
+creates the GitHub release for the tag, using this changelog's section for that version as its
+body. To exercise the publications locally without publishing, run `./gradlew publishToMavenLocal`.
 
 ## License
 
