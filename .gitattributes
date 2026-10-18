@@ -1,0 +1,13 @@
+# simt:begin
+# simt:generated
+# simt:sha=898d5a50f1f2b8f1e47875bad8195f766d448bf2
+# Generated content. Do not edit by hand - your changes are overwritten.
+# Run `simt sync --yes` to regenerate, or `simt check` to see what is stale.
+
+* text=auto eol=lf
+
+# simt:end
+
+# Windows batch scripts must retain CRLF for cmd.exe.
+*.bat text eol=crlf
+*.cmd text eol=crlf

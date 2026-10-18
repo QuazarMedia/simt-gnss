@@ -1,0 +1,26 @@
+[versions]
+# Android SDK
+compileSdk = "37"
+targetSdk = "37"
+minSdk = "28"
+
+# Build tools (pinned in lockstep with simt-app so the composite build consumes one toolchain)
+gradle = "9.4.1"
+agp = "9.4.1"
+kotlin = "2.4.21"
+spotless = "8.10.4"
+ktlint = "1.2.1"
+
+# Test
+junit = "4.13.2"
+robolectric = "4.16.1" # Pinned: 4.17 breaks the sandbox on this toolchain.
+
+[libraries]
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
+
+[plugins]
+android-library = { id = "com.android.library", version.ref = "agp" }
+jetbrains-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+jetbrains-kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+spotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
