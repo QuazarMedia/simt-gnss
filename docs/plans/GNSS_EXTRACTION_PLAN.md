@@ -82,22 +82,27 @@ renames only — no formula, constant or gating logic changes.
 
 ## 5. Public API (`:gnss-android`)
 
-`GnssEngine` (public) wraps the existing `internal GnssMeasurementProcessor`:
+`GnssEngine` (public) is a thin façade over the public-in-module `internal
+GnssMeasurementProcessor`; its names mirror the processor so `simt-app` only swaps the type:
 
-- `onNavigationMessage(GnssNavigationMessage)`
-- `onMeasurements(GnssMeasurementsEvent, GnssStatus?): ProcessedMeasurements`
-- `solve(initialLat, initialLon, initialAlt, gpsTimeNanos, accuracy, usePpp): PositionResult?`
-- `solveRtk(gpsTimeNanos, initial…): PositionResult?`
-- `importEphemeris(List<SatelliteEphemeris>, towSeconds): Int`
-- `setSmoothingMode(...)`, `ingestRtcmFrame(ByteArray)` (routes to `Rtcm3FrameParser` /
-  MSM / SSR), `ssrStore` / `rtkBaseStore` access
-- `diagnostics: StateFlow<GnssEngineDiagnostics>` (new neutral type)
+- `processNavigationMessage(GnssNavigationMessage)`
+- `processMeasurements(GnssMeasurementsEvent, GnssStatus?, selectedConstellationTypes): ProcessedMeasurements`
+- `computePosition(measurements, initialLat, initialLon, initialAlt, usePpp, gpsTimeNanos, accuracy): PositionResult?`
+- `computeRtkPosition(measurements, gpsTimeNanos, initial…): PositionResult?`
+- `importExternalEphemeris(List<SatelliteEphemeris>, towSeconds): Int`
+- `setSmoothingMode(SmoothingMode)`, `ingestRtcmFrame(ByteArray)` (routes to
+  `Rtcm3FrameParser` / `RtcmMsmParser` / `Rtcm1005Parser` / `RtcmSsrDecoder`),
+  `ssrStore` / `rtkBaseStore`, `describeStoredEphemerides()`,
+  `describeFreshEphemerisCoverage(measurements)`
+- `diagnostics(): GnssEngineDiagnostics` (new neutral snapshot type)
 
-Neutral model types (`PositionResult`, `SatelliteMeasurement`, `SatelliteEphemeris`,
-`GnssSolutionMode`, `ProcessedMeasurements`) become public API.
+`ProcessedMeasurements` and `SmoothingMode` were promoted from the processor's nested
+declarations to public top-level types in `app.simt.gnss`; neutral model types
+(`PositionResult`, `SatelliteMeasurement`, `SatelliteEphemeris`, `GnssSolutionMode`) are
+public in `:gnss-core`.
 
-`simt-app` maps `GnssEngineDiagnostics` → its `core:domain` `RawGnssDiagnostics` inside
-`GnssLocationServiceImpl`; `core:domain` is untouched.
+`simt-app` swaps `GnssMeasurementProcessor` → `GnssEngine` and the moved imports;
+`core:domain` is untouched.
 
 ## 6. Repository scaffolding
 
@@ -157,9 +162,21 @@ History is not preserved across repos (fresh commits); tests port unchanged.
 
 | id | state | depends on | slice |
 |----|-------|-----------|-------|
-| S1 | Queued | none | Scaffold `simt-gnss` Gradle build (`:gnss-core` + `:gnss-android`), wrapper, version catalog, license/readme |
-| S2 | Queued | S1 | Adopt repo with `simt init --yes`; commit scaffold |
-| S3 | Queued | S1 | Port `:gnss-core` sources + tests; apply the four Android-free seams |
-| S4 | Queued | S3 | Port `:gnss-android` processor + tests; add `GnssEngine` façade and `GnssEngineDiagnostics` |
+| S1 | Complete | none | Scaffold `simt-gnss` Gradle build (`:gnss-core` + `:gnss-android`), wrapper, version catalog, license/readme |
+| S2 | Complete | S1 | Adopt repo with `simt init --yes`; commit scaffold |
+| S3 | Complete | S1 | Port `:gnss-core` sources + tests; apply the four Android-free seams |
+| S4 | Complete | S3 | Port `:gnss-android` processor + tests; add `GnssEngine` façade and `GnssEngineDiagnostics` |
 | S5 | Queued | S4 | Wire the composite build into `simt-app`; rewrite adapters; `git rm` moved code |
 | S6 | Queued | S5 | Full validation: library tests, anti-coupling grep, `:feature:gnss:testDebugUnitTest`, `:app:assembleDebug` |
+
+### Evidence
+
+- **S1** scaffold — commit `fb25c8a`; `./gradlew projects` OK.
+- **S2** adoption — commit `fb25c8a`; simt-dev wrote `simt.json` (id `simt-gnss`, stack gradle),
+  `AGENTS.md`, `.editorconfig`, `.gitattributes`.
+- **S3** `:gnss-core` — commit `f680647`; `./gradlew :gnss-core:test` → 38 classes / 252 tests /
+  0 failures; `spotlessCheck` OK.
+- **S4** `:gnss-android` — commit `b26063d`; `./gradlew :gnss-core:test :gnss-android:test` →
+  44 classes / 287 tests / 0 failures; `./gradlew build` green.
+  Parity: simt-app `:feature:gnss` 295 tests = 287 moved + 8 staying
+  (`ChunkedStreamDecoderTest` 4, `NmeaGgaTest` 3, `GnssViewModelTest` 1).
