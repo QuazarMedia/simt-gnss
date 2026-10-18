@@ -45,26 +45,32 @@ dependencies {
     testImplementation(libs.robolectric)
 }
 
-// Coordinates, POM and the GitHub Packages target come from the root build file. The
-// `release` component only exists once AGP has created it, hence `afterEvaluate`.
+// Maven Central requires a javadoc artifact and the Portal validates its presence. API docs are
+// not generated yet, so this is an empty jar for now; pointing it at Dokka output is a follow-up.
+val javadocJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("javadoc")
+}
+
+// Coordinates and POM come from the root build file; the upload is done by nmcp. The `release`
+// component only exists once AGP has created it, hence `afterEvaluate`.
 afterEvaluate {
     publishing {
         publications {
             create<MavenPublication>("release") {
                 from(components["release"])
+                artifact(javadocJar)
             }
         }
     }
 }
 
-// Signed only when a key is supplied; GitHub Packages does not require signatures, Maven
-// Central does, so the two are one configuration away from each other.
+// Maven Central rejects unsigned artifacts, so the release workflow must supply a key. Kept
+// conditional so a plain `./gradlew build` still works without one.
 signing {
-    val signingKeyId: String? = providers.gradleProperty("signingKeyId").orNull
     val signingKey: String? = providers.gradleProperty("signingKey").orNull
     val signingPassword: String? = providers.gradleProperty("signingPassword").orNull
-    if (signingKeyId != null && signingKey != null && signingPassword != null) {
-        useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
+    if (signingKey != null && signingPassword != null) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
         sign(publishing.publications["release"])
     }
 }

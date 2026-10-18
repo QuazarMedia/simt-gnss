@@ -36,9 +36,10 @@ subprojects {
     }
 
     // Publishing is shared by the modules that opt in with `maven-publish` (see
-    // gnss-core/build.gradle.kts and gnss-android/build.gradle.kts). Coordinates, POM
-    // metadata and the target repository are declared once here so the two published
-    // artifacts cannot drift apart.
+    // gnss-core/build.gradle.kts and gnss-android/build.gradle.kts). Coordinates and POM
+    // metadata are declared once here so the two published artifacts cannot drift apart.
+    // The upload itself is done by the nmcp plugin configured in settings.gradle.kts, which
+    // ships the whole aggregation to the Maven Central Portal.
     plugins.withId("maven-publish") {
         group = "app.simt"
         version = libraryVersion
@@ -69,17 +70,6 @@ subprojects {
                         connection.set("scm:git:git://github.com/QuazarMedia/simt-gnss.git")
                         developerConnection.set("scm:git:ssh://github.com:QuazarMedia/simt-gnss.git")
                         url.set("https://github.com/QuazarMedia/simt-gnss/tree/main")
-                    }
-                }
-            }
-
-            repositories {
-                maven {
-                    name = "GitHubPackages"
-                    url = uri("https://maven.pkg.github.com/QuazarMedia/simt-gnss")
-                    credentials {
-                        username = project.findProperty("GITHUB_USER") as String? ?: System.getenv("GITHUB_USER")
-                        password = project.findProperty("GITHUB_TOKEN") as String? ?: System.getenv("GITHUB_TOKEN")
                     }
                 }
             }
