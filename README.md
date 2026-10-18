@@ -128,26 +128,12 @@ includeBuild("../simt-gnss") {
 
 ## Releasing
 
-Releases go to Maven Central from CI via the Central Portal Publisher API
-(`com.gradleup.nmcp`). `.github/workflows/publish.yml` runs on a `v*` tag — or by hand through
-`workflow_dispatch` with an explicit version — and uploads both modules.
+Releases are published to Maven Central from CI: pushing a version tag (for example `v0.2.0`)
+runs the release workflow, which uploads both modules and derives the version from the tag.
+Every artifact is signed and ships with its sources and javadoc.
 
-Required repository secrets:
-
-| Secret | Value |
-|---|---|
-| `CENTRAL_PORTAL_USERNAME`, `CENTRAL_PORTAL_PASSWORD` | A Central Portal user token (central.sonatype.com → Account → Generate User Token) |
-| `SIGNING_KEY`, `SIGNING_PASSWORD` | An ASCII-armored GPG private key and its passphrase — Central rejects unsigned artifacts |
-
-The `app.simt` group needs a verified `simt.app` namespace on the Portal: add the TXT record
-carrying the namespace's verification key to the **exact** domain `simt.app` (not a
-subdomain), and only then press "Verify Namespace".
-
-`publishingType` is `AUTOMATIC`, so a deployment is released as soon as it passes validation.
-Set it to `USER_MANAGED` in `settings.gradle.kts` to require a manual confirmation in the Portal
-UI instead. `./gradlew publishToMavenLocal` exercises the same publications locally.
-
-See [CHANGELOG.md](CHANGELOG.md) for release notes.
+Release notes live in [CHANGELOG.md](CHANGELOG.md). To exercise the publications locally without
+publishing, run `./gradlew publishToMavenLocal`.
 
 ## License
 
