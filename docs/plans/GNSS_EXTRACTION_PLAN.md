@@ -227,3 +227,14 @@ History is not preserved across repos (fresh commits); tests port unchanged.
   byte-identical, so only the SHAs changed: the SHAs quoted in this document are the post-rewrite
   ones. The upstream `Update GitHub Sponsors username in FUNDING.yml` commit had to be rewritten
   with everything else and therefore lost GitHub's signature.
+- **First release (0.1.0)** — published to Maven Central from CI. The Central Portal namespace
+  `app.simt` was verified against a `simt.app` DNS TXT record; `publishingType` is `AUTOMATIC`,
+  so a deployment is released as soon as it validates. The publish workflow supplies
+  `CENTRAL_PORTAL_USERNAME`/`CENTRAL_PORTAL_PASSWORD` (user token) and
+  `SIGNING_KEY`/`SIGNING_PASSWORD` (GPG, fingerprint
+  `7A1B70775B99A686C8F3EE8F1EDD5923F190344C`, public key on `keyserver.ubuntu.com`). One defect
+  had to be fixed first: `:gnss-android` wired its `signing` block at configuration time while the
+  `release` publication is created in `afterEvaluate`, so any build with signing credentials
+  present failed with `Publication with name 'release' not found` — signing now lives inside the
+  same `afterEvaluate` block. Evidence: run `39158066545` green, deployment
+  `905b3f22-6d7c-491c-8a35-ce36141bcbe4` uploaded with `AUTOMATIC` and validated.
