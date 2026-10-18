@@ -3,6 +3,7 @@ import app.simt.gnss.core.model.Constellation
 import app.simt.gnss.core.model.SatelliteEphemeris
 import app.simt.gnss.core.platform.GnssPlatform
 import app.simt.gnss.core.utils.GnssMathUtils
+import java.io.BufferedReader
 
 /**
  * Parses broadcast ephemeris from RINEX 3 mixed navigation file content.
@@ -12,6 +13,10 @@ import app.simt.gnss.core.utils.GnssMathUtils
  */
 object BroadcastEphemerisProvider {
     private const val TAG = "BroadcastEphProv"
+
+    /** GPS/QZSS, Galileo and BeiDou records span 8 RINEX lines; GLONASS spans 4. */
+    private const val KEPLERIAN_RECORD_LINES = 8
+    private const val GLONASS_RECORD_LINES = 4
 
     /** Retain ephemeris within this many seconds for offline propagation (24 hours). */
     private const val MAX_EPHEMERIS_AGE_SECONDS = 86400.0 // 24 hours
@@ -46,63 +51,90 @@ object BroadcastEphemerisProvider {
     }
 
     /**
-     * Parses RINEX 3 mixed navigation file content and returns ephemeris records.
-     * Handles GPS (G), GLONASS (R), Galileo (E), and BeiDou (C) satellite systems.
+     * Parses a RINEX 3 mixed navigation file handed over as one complete [String].
      *
-     * @param content Raw RINEX 3 mixed navigation file content
-     * @param gpsTimeOfWeekSeconds Current GPS time of week in seconds (for age filtering)
-     * @return Deduplicated, age-filtered list of ephemeris records
+     * Prefer [parseRinex3MixedNav] with a [BufferedReader] or a [Sequence]. A full day's
+     * broadcast navigation file is several megabytes of text; materialising it as a single
+     * `String` costs that (plus roughly as much again to build it) and `String.lines()` then
+     * allocates a second list holding every line. The streaming overloads keep only the
+     * current record in memory.
      */
     fun parseRinex3MixedNav(
         content: String,
         gpsTimeOfWeekSeconds: Double,
+    ): List<SatelliteEphemeris> = parseRinex3MixedNav(content.lineSequence(), gpsTimeOfWeekSeconds)
+
+    /**
+     * Parses a RINEX 3 mixed navigation stream line by line. The reader is consumed lazily and
+     * is not closed by this function — the caller owns it.
+     */
+    fun parseRinex3MixedNav(
+        reader: BufferedReader,
+        gpsTimeOfWeekSeconds: Double,
+    ): List<SatelliteEphemeris> = parseRinex3MixedNav(reader.lineSequence(), gpsTimeOfWeekSeconds)
+
+    /**
+     * Parses RINEX 3 mixed navigation file lines and returns ephemeris records.
+     * Handles GPS (G), GLONASS (R), Galileo (E), and BeiDou (C) satellite systems.
+     *
+     * Lines are consumed lazily; at most one record (8 lines for the Keplerian systems, 4 for
+     * GLONASS) is held at a time.
+     *
+     * @param lines Raw RINEX 3 mixed navigation file lines
+     * @param gpsTimeOfWeekSeconds Current GPS time of week in seconds (for age filtering)
+     * @return Deduplicated, age-filtered list of ephemeris records
+     */
+    fun parseRinex3MixedNav(
+        lines: Sequence<String>,
+        gpsTimeOfWeekSeconds: Double,
     ): List<SatelliteEphemeris> {
         val results = mutableListOf<SatelliteEphemeris>()
-        val lines = content.lines()
-        var i = 0
+        val iterator = lines.iterator()
 
-        // Skip header (ends with "END OF HEADER")
-        while (i < lines.size && !lines[i].contains("END OF HEADER")) i++
-        i++ // skip the END OF HEADER line
+        // Skip header (ends with "END OF HEADER"). When it is absent the iterator is drained
+        // and no record is parsed, matching the previous index-based scan.
+        while (iterator.hasNext()) {
+            if (iterator.next().contains("END OF HEADER")) break
+        }
 
         val now = GnssPlatform.timeSource.elapsedRealtimeMs()
         var totalRecords = 0
         var skippedRecords = 0
 
-        while (i < lines.size) {
-            val line = lines[i]
-            if (line.isBlank()) {
-                i++
-                continue
-            }
+        while (iterator.hasNext()) {
+            val line = iterator.next()
+            if (line.isBlank()) continue
 
-            val sysChar = line[0]
-            when (sysChar) {
+            when (line[0]) {
                 'G' -> {
                     totalRecords++
-                    val eph = parseGpsRecord(lines, i, now, gpsTimeOfWeekSeconds)
+                    val eph =
+                        readRecord(iterator, line, KEPLERIAN_RECORD_LINES)
+                            ?.let { parseGpsRecord(it, now, gpsTimeOfWeekSeconds) }
                     if (eph != null) results.add(eph) else skippedRecords++
-                    i += 8
                 }
                 'E' -> {
                     totalRecords++
-                    val eph = parseGalileoRecord(lines, i, now, gpsTimeOfWeekSeconds)
+                    val eph =
+                        readRecord(iterator, line, KEPLERIAN_RECORD_LINES)
+                            ?.let { parseGalileoRecord(it, now, gpsTimeOfWeekSeconds) }
                     if (eph != null) results.add(eph) else skippedRecords++
-                    i += 8
                 }
                 'R' -> {
                     totalRecords++
-                    val eph = parseGlonassRecord(lines, i, now, gpsTimeOfWeekSeconds)
+                    val eph =
+                        readRecord(iterator, line, GLONASS_RECORD_LINES)
+                            ?.let { parseGlonassRecord(it, now, gpsTimeOfWeekSeconds) }
                     if (eph != null) results.add(eph) else skippedRecords++
-                    i += 4
                 }
                 'C' -> {
                     totalRecords++
-                    val eph = parseBeidouRecord(lines, i, now, gpsTimeOfWeekSeconds)
+                    val eph =
+                        readRecord(iterator, line, KEPLERIAN_RECORD_LINES)
+                            ?.let { parseBeidouRecord(it, now, gpsTimeOfWeekSeconds) }
                     if (eph != null) results.add(eph) else skippedRecords++
-                    i += 8
                 }
-                else -> i++
+                else -> Unit
             }
         }
 
@@ -144,55 +176,72 @@ object BroadcastEphemerisProvider {
         return filtered
     }
 
+    /**
+     * Reads a record's continuation lines. [firstLine] is the system-character line already
+     * consumed by the caller; the remaining [size] − 1 lines are pulled from [iterator].
+     * Returns null when the stream ends (or the record is short) before it is complete.
+     */
+    private fun readRecord(
+        iterator: Iterator<String>,
+        firstLine: String,
+        size: Int,
+    ): List<String>? {
+        val record = ArrayList<String>(size)
+        record.add(firstLine)
+        while (record.size < size) {
+            if (!iterator.hasNext()) return null
+            record.add(iterator.next())
+        }
+        return record
+    }
+
     // ---- GPS/QZSS RINEX record (8 lines) ----
     private fun parseGpsRecord(
-        lines: List<String>,
-        startLine: Int,
+        record: List<String>,
         now: Long,
         gpsTow: Double,
     ): SatelliteEphemeris? {
-        if (startLine + 7 >= lines.size) return null
         return try {
-            val l0 = lines[startLine]
+            val l0 = record[0]
             val svid = l0.substring(1, 3).trim().toInt()
             val af0 = parseRinexDouble(l0, 23, 19)
             val af1 = parseRinexDouble(l0, 42, 19)
             val af2 = parseRinexDouble(l0, 61, 19)
 
-            val l1 = lines[startLine + 1]
+            val l1 = record[1]
             val iode = parseRinexDouble(l1, 4, 19).toInt() // IODE — gates SSR application
             val crs = parseRinexDouble(l1, 23, 19)
             val deltaN = parseRinexDouble(l1, 42, 19) // already in rad/s
             val m0 = parseRinexDouble(l1, 61, 19) // rad
 
-            val l2 = lines[startLine + 2]
+            val l2 = record[2]
             val cuc = parseRinexDouble(l2, 4, 19)
             val eccentricity = parseRinexDouble(l2, 23, 19)
             val cus = parseRinexDouble(l2, 42, 19)
             val sqrtA = parseRinexDouble(l2, 61, 19)
 
-            val l3 = lines[startLine + 3]
+            val l3 = record[3]
             val toe = parseRinexDouble(l3, 4, 19)
             val cic = parseRinexDouble(l3, 23, 19)
             val omega0 = parseRinexDouble(l3, 42, 19) // OMEGA0 (rad)
             val cis = parseRinexDouble(l3, 61, 19)
 
-            val l4 = lines[startLine + 4]
+            val l4 = record[4]
             val i0 = parseRinexDouble(l4, 4, 19) // rad
             val crc = parseRinexDouble(l4, 23, 19)
             val omega = parseRinexDouble(l4, 42, 19) // omega (rad)
             val omegaDot = parseRinexDouble(l4, 61, 19) // rad/s
 
-            val l5 = lines[startLine + 5]
+            val l5 = record[5]
             val iDot = parseRinexDouble(l5, 4, 19) // rad/s
             val week = parseRinexDouble(l5, 42, 19).toInt()
 
-            val l6 = lines[startLine + 6]
+            val l6 = record[6]
             val health = parseRinexDouble(l6, 23, 19).toInt()
             if (health != 0) return null
             val tgd = parseRinexDouble(l6, 42, 19)
 
-            val l7 = lines[startLine + 7]
+            val l7 = record[7]
             val toc = toe // RINEX stores epoch which maps to toc
 
             SatelliteEphemeris(
@@ -230,49 +279,47 @@ object BroadcastEphemerisProvider {
 
     // ---- Galileo RINEX record (8 lines, same structure as GPS) ----
     private fun parseGalileoRecord(
-        lines: List<String>,
-        startLine: Int,
+        record: List<String>,
         now: Long,
         gpsTow: Double,
     ): SatelliteEphemeris? {
-        if (startLine + 7 >= lines.size) return null
         return try {
-            val l0 = lines[startLine]
+            val l0 = record[0]
             val svid = l0.substring(1, 3).trim().toInt()
             val af0 = parseRinexDouble(l0, 23, 19)
             val af1 = parseRinexDouble(l0, 42, 19)
             val af2 = parseRinexDouble(l0, 61, 19)
 
-            val l1 = lines[startLine + 1]
+            val l1 = record[1]
             val iodNav = parseRinexDouble(l1, 4, 19).toInt() // IODnav — gates SSR application
             val crs = parseRinexDouble(l1, 23, 19)
             val deltaN = parseRinexDouble(l1, 42, 19)
             val m0 = parseRinexDouble(l1, 61, 19)
 
-            val l2 = lines[startLine + 2]
+            val l2 = record[2]
             val cuc = parseRinexDouble(l2, 4, 19)
             val eccentricity = parseRinexDouble(l2, 23, 19)
             val cus = parseRinexDouble(l2, 42, 19)
             val sqrtA = parseRinexDouble(l2, 61, 19)
 
-            val l3 = lines[startLine + 3]
+            val l3 = record[3]
             val toe = parseRinexDouble(l3, 4, 19)
             val cic = parseRinexDouble(l3, 23, 19)
             val omega0 = parseRinexDouble(l3, 42, 19)
             val cis = parseRinexDouble(l3, 61, 19)
 
-            val l4 = lines[startLine + 4]
+            val l4 = record[4]
             val i0 = parseRinexDouble(l4, 4, 19)
             val crc = parseRinexDouble(l4, 23, 19)
             val omega = parseRinexDouble(l4, 42, 19)
             val omegaDot = parseRinexDouble(l4, 61, 19)
 
-            val l5 = lines[startLine + 5]
+            val l5 = record[5]
             val iDot = parseRinexDouble(l5, 4, 19)
             val dataSources = parseRinexDouble(l5, 23, 19).toInt()
             val week = parseRinexDouble(l5, 42, 19).toInt()
 
-            val l6 = lines[startLine + 6]
+            val l6 = record[6]
             val health = parseRinexDouble(l6, 23, 19).toInt()
             if (galileoRecordUnhealthy(dataSources, health)) return null
             // BROADCAST ORBIT - 6: BGD(E1,E5a) then BGD(E1,E5b). The stored clock's own
@@ -320,34 +367,32 @@ object BroadcastEphemerisProvider {
 
     // ---- GLONASS RINEX record (4 lines) ----
     private fun parseGlonassRecord(
-        lines: List<String>,
-        startLine: Int,
+        record: List<String>,
         now: Long,
         gpsTow: Double,
     ): SatelliteEphemeris? {
-        if (startLine + 3 >= lines.size) return null
         return try {
-            val l0 = lines[startLine]
+            val l0 = record[0]
             val svid = l0.substring(1, 3).trim().toInt()
             // RINEX GLONASS line 0: epoch (= tb, UTC), -TauN, +GammaN, message frame time (tk, unused)
             val tauN = -parseRinexDouble(l0, 23, 19) // RINEX stores -TauN, we want +TauN
             val gammaN = parseRinexDouble(l0, 42, 19)
 
             // Line 1: X(km), Xdot(km/s), Xdotdot(km/s²), health
-            val l1 = lines[startLine + 1]
+            val l1 = record[1]
             val posX = parseRinexDouble(l1, 4, 19) * 1e3 // km → m
             val velX = parseRinexDouble(l1, 23, 19) * 1e3 // km/s → m/s
             val accX = parseRinexDouble(l1, 42, 19) * 1e3 // km/s² → m/s²
             val health = parseRinexDouble(l1, 61, 19).toInt()
 
             // Line 2: Y, Ydot, Ydotdot, frequency number
-            val l2 = lines[startLine + 2]
+            val l2 = record[2]
             val posY = parseRinexDouble(l2, 4, 19) * 1e3
             val velY = parseRinexDouble(l2, 23, 19) * 1e3
             val accY = parseRinexDouble(l2, 42, 19) * 1e3
 
             // Line 3: Z, Zdot, Zdotdot, age of ephemeris
-            val l3 = lines[startLine + 3]
+            val l3 = record[3]
             val posZ = parseRinexDouble(l3, 4, 19) * 1e3
             val velZ = parseRinexDouble(l3, 23, 19) * 1e3
             val accZ = parseRinexDouble(l3, 42, 19) * 1e3
@@ -403,47 +448,45 @@ object BroadcastEphemerisProvider {
 
     // ---- BeiDou RINEX record (8 lines, Keplerian like GPS) ----
     private fun parseBeidouRecord(
-        lines: List<String>,
-        startLine: Int,
+        record: List<String>,
         now: Long,
         gpsTow: Double,
     ): SatelliteEphemeris? {
-        if (startLine + 7 >= lines.size) return null
         return try {
-            val l0 = lines[startLine]
+            val l0 = record[0]
             val svid = l0.substring(1, 3).trim().toInt()
             val af0 = parseRinexDouble(l0, 23, 19)
             val af1 = parseRinexDouble(l0, 42, 19)
             val af2 = parseRinexDouble(l0, 61, 19)
 
-            val l1 = lines[startLine + 1]
+            val l1 = record[1]
             val crs = parseRinexDouble(l1, 23, 19)
             val deltaN = parseRinexDouble(l1, 42, 19)
             val m0 = parseRinexDouble(l1, 61, 19)
 
-            val l2 = lines[startLine + 2]
+            val l2 = record[2]
             val cuc = parseRinexDouble(l2, 4, 19)
             val eccentricity = parseRinexDouble(l2, 23, 19)
             val cus = parseRinexDouble(l2, 42, 19)
             val sqrtA = parseRinexDouble(l2, 61, 19)
 
-            val l3 = lines[startLine + 3]
+            val l3 = record[3]
             val toe = parseRinexDouble(l3, 4, 19)
             val cic = parseRinexDouble(l3, 23, 19)
             val omega0 = parseRinexDouble(l3, 42, 19)
             val cis = parseRinexDouble(l3, 61, 19)
 
-            val l4 = lines[startLine + 4]
+            val l4 = record[4]
             val i0 = parseRinexDouble(l4, 4, 19)
             val crc = parseRinexDouble(l4, 23, 19)
             val omega = parseRinexDouble(l4, 42, 19)
             val omegaDot = parseRinexDouble(l4, 61, 19)
 
-            val l5 = lines[startLine + 5]
+            val l5 = record[5]
             val iDot = parseRinexDouble(l5, 4, 19)
             val week = parseRinexDouble(l5, 42, 19).toInt()
 
-            val l6 = lines[startLine + 6]
+            val l6 = record[6]
             val satH1 = parseRinexDouble(l6, 23, 19).toInt()
             if (satH1 != 0) return null
             val tgd = parseRinexDouble(l6, 42, 19)

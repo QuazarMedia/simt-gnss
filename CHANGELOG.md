@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`:gnss-core`** — `BroadcastEphemerisProvider.parseRinex3MixedNav` overloads that take a
+  `BufferedReader` or a `Sequence<String>` and parse line-by-line, holding only the current
+  record in memory. The previous `String` entry point built the whole file (and, via
+  `String.lines()`, a second list of every line) in one parse; a full day's broadcast navigation
+  file is several megabytes and OOM'd A-GNSS on a heap-constrained device.
+
 ## [0.1.0] - 2026-10-18
 
 First public release.

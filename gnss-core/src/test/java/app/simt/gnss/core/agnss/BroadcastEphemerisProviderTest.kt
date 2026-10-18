@@ -199,4 +199,67 @@ class BroadcastEphemerisProviderTest {
         assertEquals(true, onlyInav.galileoInavClock)
         assertEquals(bgdB, onlyInav.tgd, 0.0)
     }
+
+    /** Names as (constellation, svid) so two parses can be compared without value equality. */
+    private fun ids(records: List<app.simt.gnss.core.model.SatelliteEphemeris>) = records.map { it.constellationType to it.svid }
+
+    @Test
+    fun streamingOverloads_matchTheStringOverload() {
+        // GPS + BeiDou + GLONASS in one mixed file: the BufferedReader and Sequence entry points
+        // must return exactly what the String entry point returns.
+        val now = gpsTow(2026, 6, 11, 6, 25)
+        val toe = now - 600.0
+        val content =
+            rinex(
+                keplerRecord('G', 7, toe, now, line5Field2 = 0.0, health = 0.0) +
+                    keplerRecord('C', 6, toe, now, line5Field2 = 0.0, health = 0.0) +
+                    glonassRecord(svid = 5, hour = 6, minute = 15, frameTimeSecondsOfDay = 0.0),
+            )
+
+        val expected = BroadcastEphemerisProvider.parseRinex3MixedNav(content, now)
+        val viaReader =
+            content.reader().buffered().use { BroadcastEphemerisProvider.parseRinex3MixedNav(it, now) }
+        val viaSequence = BroadcastEphemerisProvider.parseRinex3MixedNav(content.lineSequence(), now)
+
+        assertEquals(3, expected.size)
+        assertEquals(ids(expected), ids(viaReader))
+        assertEquals(ids(expected), ids(viaSequence))
+    }
+
+    @Test
+    fun sequenceOverload_walksANonRepeatableSourceOnce() {
+        // A generated, single-pass source: the parser must walk it once, in order, without
+        // random access. (The previous implementation materialised `content.lines()` into a
+        // List of every line — the second large allocation behind the A-GNSS OOM.)
+        val now = 345_600.0
+        val bodyLines = rinex(keplerRecord('G', 7, now - 600.0, now, line5Field2 = 0.0, health = 0.0)).lines()
+        var consumed = 0
+        val oneShot =
+            sequence {
+                for (line in bodyLines) {
+                    consumed++
+                    yield(line)
+                }
+            }
+
+        val records = BroadcastEphemerisProvider.parseRinex3MixedNav(oneShot, now)
+
+        assertEquals(1, records.size)
+        assertEquals(7, records[0].svid)
+        assertEquals(bodyLines.size, consumed)
+    }
+
+    @Test
+    fun truncatedRecord_atEndOfFile_isSkippedNotThrown() {
+        // Five of the eight record lines survive the truncation; the stream ends mid-record.
+        // The parser must drop it, not index past the end.
+        val now = 345_600.0
+        val truncated =
+            rinex(keplerRecord('G', 7, now - 600.0, now, line5Field2 = 0.0, health = 0.0))
+                .lines()
+                .dropLast(3)
+                .joinToString("\n")
+
+        assertEquals(0, BroadcastEphemerisProvider.parseRinex3MixedNav(truncated, now).size)
+    }
 }
