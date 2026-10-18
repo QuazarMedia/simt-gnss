@@ -6,7 +6,9 @@ import app.simt.gnss.core.utils.GnssMathUtils
 
 /**
  * Parses broadcast ephemeris from RINEX 3 mixed navigation file content.
- * The download is handled by [app.simt.core.domain.location.service.BroadcastEphemerisService].
+ *
+ * The download itself is left to the caller; this parser only turns the file content it is handed
+ * into [SatelliteEphemeris] records.
  */
 object BroadcastEphemerisProvider {
     private const val TAG = "BroadcastEphProv"
