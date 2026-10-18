@@ -197,3 +197,26 @@ History is not preserved across repos (fresh commits); tests port unchanged.
   change. Library tests re-verified: `:gnss-core` 38 classes / 252 tests, `:gnss-android`
   7 classes / 40 tests (292 total, 0 failures); `simt-app` `:feature:gnss:testDebugUnitTest`
   3 classes / 8 tests green.
+- **Publishing & CI** — the library publishes to GitHub Packages
+  (`https://maven.pkg.github.com/QuazarMedia/simt-gnss`) as `app.simt:gnss-core` and
+  `app.simt:gnss-android`, versioned by `VERSION_NAME` (default `0.1.0`), each with a
+  `-sources.jar`. Both modules opt into `maven-publish` + `signing` (signing only when
+  `-PsigningKeyId/-PsigningKey/-PsigningPassword` are supplied); coordinates, POM metadata and
+  the target repository are declared once in the root build file so the two artifacts cannot
+  drift. `.github/workflows/build.yml` runs `./gradlew build` on `main` and on pull requests;
+  `.github/workflows/publish.yml` publishes on `v*` tags (or by manual dispatch) and derives the
+  version from the tag. The estate's generated `simt-dev-check.yml` was deliberately not added:
+  it installs Node dependencies and expects a `simt-dev` binary, and this repo is a Node-less
+  Gradle project whose `simt.json` declares no gates. Evidence: `./gradlew publishToMavenLocal`
+  green, writing `app/simt/gnss-core/0.1.0/{.jar,-sources.jar,.pom,.module}` and
+  `app/simt/gnss-android/0.1.0/{.aar,-sources.jar,.pom,.module}`; the AAR POM depends on
+  `app.simt:gnss-core:0.1.0`; `./gradlew build` green including `:gnss-android:lintDebug`.
+- **Skill split** — `gnss-engine` now lives here (`.cursor/skills/gnss-engine/SKILL.md`, plus the
+  `.claude/skills` symlink the estate uses) and documents the library's modules, neutral seams,
+  public API, parser convention and invariants; `simt-app` carries a consumer-oriented
+  `gnss-integration` skill instead, covering the composite-build boundary, the NTRIP/location
+  adapters and the diagnostics mapping. Both are registered in
+  `simt-dev/graph/skills.graph.json`. Evidence: `node bin/simt-dev.mjs graph lint` → `OK no
+  findings` (38 skills, byte counts verified); `node --test test/*.test.mjs` → 1097 passing.
+- **Consumer proguard** — `simt-app/feature/gnss` gained the `proguard-rules.pro` its release
+  build already referenced; the engine's own rules travel with `app.simt:gnss-android`.
