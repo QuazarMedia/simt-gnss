@@ -28,6 +28,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Pin the package list explicitly. The action's older default asked for the `tools`
+          # package, which Google no longer serves, so it failed with "Failed to find package 'tools'".
+          packages: 'platform-tools'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
