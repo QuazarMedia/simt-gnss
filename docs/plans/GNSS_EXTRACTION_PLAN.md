@@ -166,8 +166,8 @@ History is not preserved across repos (fresh commits); tests port unchanged.
 | S2 | Complete | S1 | Adopt repo with `simt init --yes`; commit scaffold |
 | S3 | Complete | S1 | Port `:gnss-core` sources + tests; apply the four Android-free seams |
 | S4 | Complete | S3 | Port `:gnss-android` processor + tests; add `GnssEngine` façade and `GnssEngineDiagnostics` |
-| S5 | Queued | S4 | Wire the composite build into `simt-app`; rewrite adapters; `git rm` moved code |
-| S6 | Queued | S5 | Full validation: library tests, anti-coupling grep, `:feature:gnss:testDebugUnitTest`, `:app:assembleDebug` |
+| S5 | Complete | S4 | Wire the composite build into `simt-app`; rewrite adapters; `git rm` moved code |
+| S6 | Complete | S5 | Full validation: library tests, anti-coupling grep, `:feature:gnss:testDebugUnitTest`, `:app:assembleDebug` |
 
 ### Evidence
 
@@ -180,3 +180,10 @@ History is not preserved across repos (fresh commits); tests port unchanged.
   44 classes / 287 tests / 0 failures; `./gradlew build` green.
   Parity: simt-app `:feature:gnss` 295 tests = 287 moved + 8 staying
   (`ChunkedStreamDecoderTest` 4, `NmeaGgaTest` 3, `GnssViewModelTest` 1).
+- **S5** composite build + adapter rewrite — `simt-app` commit `5c84f549e`; 34 sources + 42 tests
+  deleted, `GnssLocationServiceImpl` repointed to `app.simt.gnss(.core).*`.
+- **S6** validation — library `./gradlew build` green (core 38 classes / 252 tests,
+  android 7 classes / 40 tests = 292, the 5 extra being the new `GnssEngineTest`); simt-app
+  `:feature:gnss:testDebugUnitTest` 3 classes / 8 tests green; `:app:assembleDebug` green;
+  anti-coupling grep over `gnss-core/src` + `gnss-android/src` CLEAN (no `app.simt.core` /
+  `app.simt.feature` / androidx / dagger references), and `:gnss-core` has no `android.*` imports.

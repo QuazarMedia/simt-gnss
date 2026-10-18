@@ -24,15 +24,50 @@ standard library.
 ```kotlin
 // from :gnss-android
 val engine = GnssEngine(suppressSbas = false)
-engine.onNavigationMessage(navMessage)                 // feed raw nav messages
-val epoch = engine.onMeasurements(event, gnssStatus)   // feed raw measurements
-val fix: PositionResult? = engine.solve(
-    initialLat = lat, initialLon = lon, initialAlt = alt, gpsTimeNanos = epoch.gpsTimeNanos,
+
+engine.processNavigationMessage(navMessage)                    // feed raw nav messages
+val epoch = engine.processMeasurements(event, gnssStatus)       // feed raw measurements
+engine.ingestRtcmFrame(rtcmBytes)                               // optional: feed an NTRIP/RTCM stream
+
+val fix: PositionResult? = engine.computePosition(
+    measurements = epoch.measurements,
+    initialLat = lat, initialLon = lon, initialAlt = alt,
+    gpsTimeNanos = epoch.gpsTimeNanos,
 )
+// or, against the base station in engine.rtkBaseStore:
+val rtk: PositionResult? = engine.computeRtkPosition(epoch.measurements, epoch.gpsTimeNanos)
 ```
 
 All results use neutral model types (`PositionResult`, `SatelliteMeasurement`,
-`SatelliteEphemeris`, `GnssSolutionMode`) declared in `:gnss-core`.
+`SatelliteEphemeris`, `GnssSolutionMode`, `ProcessedMeasurements`, `GnssEngineDiagnostics`)
+declared in `:gnss-core` / `:gnss-android`. `engine.diagnostics()` returns a neutral snapshot
+for logging or a diagnostics panel.
+
+## Consuming the library
+
+Until releases are published, consume it as a **composite build**. In the consumer's
+`settings.gradle.kts`:
+
+```kotlin
+includeBuild("../simt-gnss") {
+    dependencySubstitution {
+        substitute(module("app.simt:gnss-core")).using(project(":gnss-core"))
+        substitute(module("app.simt:gnss-android")).using(project(":gnss-android"))
+    }
+}
+```
+
+then depend on it:
+
+```kotlin
+dependencies {
+    implementation("app.simt:gnss-android") // brings :gnss-core transitively
+}
+```
+
+For plain-JVM post-processing, depend on `app.simt:gnss-core` alone: its parsers, solvers,
+filters and models are Android-free. `:gnss-android` installs the `SystemClock`/`Log` platform
+seams automatically on construction.
 
 ## Building
 
