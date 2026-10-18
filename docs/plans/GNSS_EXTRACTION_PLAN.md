@@ -171,12 +171,12 @@ History is not preserved across repos (fresh commits); tests port unchanged.
 
 ### Evidence
 
-- **S1** scaffold — commit `fb25c8a`; `./gradlew projects` OK.
-- **S2** adoption — commit `fb25c8a`; simt-dev wrote `simt.json` (id `simt-gnss`, stack gradle),
+- **S1** scaffold — commit `351869c`; `./gradlew projects` OK.
+- **S2** adoption — commit `351869c`; simt-dev wrote `simt.json` (id `simt-gnss`, stack gradle),
   `AGENTS.md`, `.editorconfig`, `.gitattributes`.
-- **S3** `:gnss-core` — commit `f680647`; `./gradlew :gnss-core:test` → 38 classes / 252 tests /
+- **S3** `:gnss-core` — commit `b3df201`; `./gradlew :gnss-core:test` → 38 classes / 252 tests /
   0 failures; `spotlessCheck` OK.
-- **S4** `:gnss-android` — commit `b26063d`; `./gradlew :gnss-core:test :gnss-android:test` →
+- **S4** `:gnss-android` — commit `7eadcb4`; `./gradlew :gnss-core:test :gnss-android:test` →
   44 classes / 287 tests / 0 failures; `./gradlew build` green.
   Parity: simt-app `:feature:gnss` 295 tests = 287 moved + 8 staying
   (`ChunkedStreamDecoderTest` 4, `NmeaGgaTest` 3, `GnssViewModelTest` 1).
@@ -197,13 +197,13 @@ History is not preserved across repos (fresh commits); tests port unchanged.
   change. Library tests re-verified: `:gnss-core` 38 classes / 252 tests, `:gnss-android`
   7 classes / 40 tests (292 total, 0 failures); `simt-app` `:feature:gnss:testDebugUnitTest`
   3 classes / 8 tests green.
-- **Publishing & CI** — the library publishes to GitHub Packages
-  (`https://maven.pkg.github.com/QuazarMedia/simt-gnss`) as `app.simt:gnss-core` and
-  `app.simt:gnss-android`, versioned by `VERSION_NAME` (default `0.1.0`), each with a
-  `-sources.jar`. Both modules opt into `maven-publish` + `signing` (signing only when
-  `-PsigningKeyId/-PsigningKey/-PsigningPassword` are supplied); coordinates, POM metadata and
-  the target repository are declared once in the root build file so the two artifacts cannot
-  drift. `.github/workflows/build.yml` runs `./gradlew build` on `main` and on pull requests;
+- **Publishing & CI** — the library publishes to **Maven Central** as `app.simt:gnss-core` and
+  `app.simt:gnss-android` (Central Portal namespace `app.simt`, uploaded with `com.gradleup.nmcp`),
+  versioned by `VERSION_NAME` (default `0.1.0`), each with `-sources.jar` and `-javadoc.jar`.
+  It was first aimed at GitHub Packages (`https://maven.pkg.github.com/QuazarMedia/simt-gnss`) and
+  moved so the estate publishes under a single owner. Both modules opt into `maven-publish` +
+  `signing` (signing only when `-PsigningKey/-PsigningPassword` are supplied); coordinates and POM
+  metadata are declared once in the root build file so the two artifacts cannot drift. `.github/workflows/build.yml` runs `./gradlew build` on `main` and on pull requests;
   `.github/workflows/publish.yml` publishes on `v*` tags (or by manual dispatch) and derives the
   version from the tag. The estate's generated `simt-dev-check.yml` was deliberately not added:
   it installs Node dependencies and expects a `simt-dev` binary, and this repo is a Node-less
@@ -220,3 +220,10 @@ History is not preserved across repos (fresh commits); tests port unchanged.
   findings` (38 skills, byte counts verified); `node --test test/*.test.mjs` → 1097 passing.
 - **Consumer proguard** — `simt-app/feature/gnss` gained the `proguard-rules.pro` its release
   build already referenced; the engine's own rules travel with `app.simt:gnss-android`.
+- **History re-authored** — every commit in this repository was rewritten so both author and
+  committer are the estate's anonymous identity
+  (`Said Elimam <169009+saidelimam@users.noreply.github.com>`, taken from the untracked
+  `git.config`), because the first commits were made with a personal address. Trees are
+  byte-identical, so only the SHAs changed: the SHAs quoted in this document are the post-rewrite
+  ones. The upstream `Update GitHub Sponsors username in FUNDING.yml` commit had to be rewritten
+  with everything else and therefore lost GitHub's signature.
