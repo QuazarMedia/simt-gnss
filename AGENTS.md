@@ -1,13 +1,13 @@
 <!-- simt:begin -->
 <!-- simt:generated -->
-<!-- simt:sha=898d5a50f1f2b8f1e47875bad8195f766d448bf2 -->
+<!-- simt:sha=e64c69c548517daaa897c8b18aa9f9903d22e20b -->
 <!-- simt:sources=rules/core.md,rules/stacks/android.md,rules/stacks/jvm.md,rules/mdc/intake-questions.mdc,rules/mdc/slice-commit.mdc,rules/mdc/test-gate.mdc -->
 <!-- Generated content. Do not edit by hand - your changes are overwritten.
      Run `simt sync --yes` to regenerate, or `simt check` to see what is stale. -->
 
 ## Core
 
-Where a rule cites a decision, run `simt-dev rules why ADR-NNN` to read it,
+Where a rule cites a decision, run `simt rules why ADR-NNN` to read it,
 including whether it is still in force.
 
 These rules are stack-agnostic. Whatever is specific to your stack, your product or your
@@ -292,5 +292,9 @@ Return `BLOCK` when:
 
 The last two are complementary, not alternatives. A reviewer that checks only one of them
 misses half of the failure they exist to catch.
+
+## Disclosure
+
+- gnss-engine — Navigate and extend the simt-gnss GNSS engine library (app.simt:gnss-core / app.simt:gnss-android) - pure-JVM parsers, solvers, filters, corrections and orbit computation, plus the Android GnssMeasurementProcessor and its public SimtGnssEngine facade. Use for any task mentioning GNSS, RTK, PPP, RTCM, SBAS, NTRIP, ephemeris, pseudorange, carrier phase, ionosphere/troposphere, Klobuchar, satellite constellations, or raw GnssMeasurement processing.
 
 <!-- simt:end -->
