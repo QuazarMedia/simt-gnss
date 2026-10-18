@@ -45,8 +45,9 @@ for logging or a diagnostics panel.
 
 ## Consuming the library
 
-Until releases are published, consume it as a **composite build**. In the consumer's
-`settings.gradle.kts`:
+Releases are published to Maven Central as `app.simt:gnss-core` and `app.simt:gnss-android`.
+Until the first release is verified there, consume it as a **composite build**. In the
+consumer's `settings.gradle.kts`:
 
 ```kotlin
 includeBuild("../simt-gnss") {
@@ -78,6 +79,27 @@ seams automatically on construction.
 ```
 
 `minSdk` 28, `compileSdk` 37, JVM toolchain 21.
+
+## Releasing
+
+Releases go to Maven Central from CI via the Central Portal Publisher API
+(`com.gradleup.nmcp`). `.github/workflows/publish.yml` runs on a `v*` tag — or by hand through
+`workflow_dispatch` with an explicit version — and uploads both modules.
+
+Required repository secrets:
+
+| Secret | Value |
+|---|---|
+| `CENTRAL_PORTAL_USERNAME`, `CENTRAL_PORTAL_PASSWORD` | A Central Portal user token (central.sonatype.com → Account → Generate User Token) |
+| `SIGNING_KEY`, `SIGNING_PASSWORD` | An ASCII-armored GPG private key and its passphrase — Central rejects unsigned artifacts |
+
+The `app.simt` group needs a verified `simt.app` namespace on the Portal: add the TXT record
+carrying the namespace's verification key to the **exact** domain `simt.app` (not a
+subdomain), and only then press "Verify Namespace".
+
+`publishingType` is `USER_MANAGED`, so a release finishes with a manual confirmation in the
+Portal UI; switch it to `AUTOMATIC` in `settings.gradle.kts` to publish as soon as the upload
+passes validation. `./gradlew publishToMavenLocal` exercises the same publications locally.
 
 ## License
 
