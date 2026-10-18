@@ -23,8 +23,8 @@ nmcpSettings {
         password = providers.gradleProperty("centralPortalPassword").orNull
             ?: System.getenv("CENTRAL_PORTAL_PASSWORD")
             ?: ""
-        // Upload the deployment, then confirm the release by hand in the Portal UI.
-        publishingType = "USER_MANAGED"
+        // Release as soon as the deployment validates; no manual confirmation in the Portal UI.
+        publishingType = "AUTOMATIC"
     }
 }
 
