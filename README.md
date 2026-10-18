@@ -1,5 +1,7 @@
 # simt-gnss
 
+![Four satellites on two orbital rings above the Earth's horizon, each throwing a dotted line of signal down to a receiver on the ground](res/art-gnss-constellation.webp)
+
 A standalone, app-agnostic GNSS processing engine for Android, packaged as a reusable Kotlin
 library. It turns raw Android GNSS observations into positions — broadcast-ephemeris decoding,
 satellite orbit and clock computation, atmospheric and RTK/PPP corrections, carrier smoothing,
@@ -11,46 +13,12 @@ no networking. Any Android app can consume it, and the algorithm layer runs on p
 
 ## Features
 
-**Signal decoding**
-
-- Broadcast navigation messages: GPS LNAV (L1 C/A), GPS CNAV MT30 (L2C/L5 ISC), Galileo I/NAV,
-  BeiDou D1 (BDT time base), GLONASS L1OF, SBAS (types 1, 2–5, 9, 24–25).
-- Nav-message validation, including the LNAV D30 polarity inversion.
-- RTCM 3: CRC-24Q frame/stream parsing, MSM4–MSM7 observation messages, message 1005 base-station
-  ECEF, and SSR orbit/clock/code-bias/phase-bias decoding.
-
-**Modelling**
-
-- Orbit and clock propagation: Keplerian elements (GPS, Galileo, BeiDou, QZSS), GLONASS RK4
-  numerical integration, SBAS GEO, plus elevation/azimuth and Earth-rotation (Sagnac) terms.
-- Ionosphere: Klobuchar model, plus the ionosphere-free L1/L5 combination for dual-frequency
-  receivers.
-- Troposphere: Saastamoinen with the Niell mapping function.
-- Broadcast-ephemeris import from RINEX 3 (mixed) files, and external ephemeris injection.
-
-**Positioning**
-
-- Iterated weighted least squares with two matrix strategies — Householder QR (high accuracy) and
-  Cholesky (medium) — with per-constellation clock states (inter-system bias) and RAIM outlier
-  rejection.
-- Covariance and DOP output (`gdop`, `pdop`, `hdop`, `vdop`, `tdop`), residual RMS and fix metadata.
-- Doppler velocity solution and TDCP (time-differenced carrier phase) displacement solution.
-- Relative positioning: RTK double-difference (float) with LAMBDA integer ambiguity resolution and
-  ambiguity memory across epochs.
-- Correction application: SSR orbit/clock/bias (applied only when the correction IOD matches the
-  broadcast ephemeris IODE, dropped when stale) and an RTK base-observation store.
-- Activity smoothing: Hatch carrier smoothing with cycle-slip detection, a Doppler smoother as
-  fallback, and a 6-state inter-epoch Kalman filter with resets on time gaps, innovation outliers
-  and mode changes.
-- Raw-GNSS fallback ladder that progressively excludes constellations when a fix cannot be found,
-  under a configurable time budget.
-
-**Engineering**
-
-- `:gnss-core` is pure JVM: zero `android.*` imports. Android concepts arrive through neutral
-  seams — pluggable clock and logger (`GnssPlatform`) and neutral `Constellation` / `AdrState`
-  constants.
-- Results are neutral model types, so the engine can be driven from any source of observations.
+| Area | What it covers |
+|---|---|
+| **Signal decoding** | **Broadcast navigation messages** — GPS LNAV (L1 C/A), GPS CNAV MT30 (L2C/L5 ISC), Galileo I/NAV, BeiDou D1 (BDT time base), GLONASS L1OF, SBAS (types 1, 2–5, 9, 24–25).<br>**Message validation** — including the LNAV D30 polarity inversion.<br>**RTCM 3** — CRC-24Q frame/stream parsing, MSM4–MSM7 observation messages, message 1005 base-station ECEF, and SSR orbit/clock/code-bias/phase-bias decoding. |
+| **Modelling** | **Orbit and clock propagation** — Keplerian elements (GPS, Galileo, BeiDou, QZSS), GLONASS RK4 numerical integration, SBAS GEO, plus elevation/azimuth and Earth-rotation (Sagnac) terms.<br>**Ionosphere** — Klobuchar model, plus the ionosphere-free L1/L5 combination for dual-frequency receivers.<br>**Troposphere** — Saastamoinen with the Niell mapping function.<br>**Ephemeris sources** — broadcast-ephemeris import from RINEX 3 (mixed) files, and external ephemeris injection. |
+| **Positioning** | **Solver** — iterated weighted least squares with two matrix strategies — Householder QR (high accuracy) and Cholesky (medium) — with per-constellation clock states (inter-system bias) and RAIM outlier rejection.<br>**Solution output** — covariance and DOP (`gdop`, `pdop`, `hdop`, `vdop`, `tdop`), residual RMS and fix metadata.<br>**Velocity and displacement** — a Doppler velocity solution and a TDCP (time-differenced carrier phase) displacement solution.<br>**Relative positioning** — RTK double-difference (float) with LAMBDA integer ambiguity resolution and ambiguity memory across epochs.<br>**Corrections** — SSR orbit/clock/bias (applied only when the correction IOD matches the broadcast ephemeris IODE, dropped when stale) and an RTK base-observation store.<br>**Smoothing and filtering** — Hatch carrier smoothing with cycle-slip detection, a Doppler smoother as fallback, and a 6-state inter-epoch Kalman filter with resets on time gaps, innovation outliers and mode changes.<br>**Fallback ladder** — raw-GNSS fallback that progressively excludes constellations when a fix cannot be found, under a configurable time budget. |
+| **Engineering** | **Layering** — `:gnss-core` is pure JVM: zero `android.*` imports. Android concepts arrive through neutral seams — pluggable clock and logger (`GnssPlatform`) and neutral `Constellation` / `AdrState` constants.<br>**Neutral results** — results are neutral model types, so the engine can be driven from any source of observations. |
 
 Not included by design: NTRIP/network clients, UI, persistence and dependency injection. The
 library processes what you feed it and returns a solution; the host application owns transports
