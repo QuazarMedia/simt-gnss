@@ -19,7 +19,7 @@ Two repositories:
 - **`~/code/simt/simt-gnss`** — new standalone library.
   - `:gnss-core` — pure Kotlin/JVM algorithms (parsers, solvers, filters, corrections,
     orbit, math, models). No Android dependency.
-  - `:gnss-android` — Android library: the orchestrator/processor, the public `GnssEngine`
+  - `:gnss-android` — Android library: the orchestrator/processor, the public `SimtGnssEngine`
     façade, platform mappers and neutral diagnostics.
   - Namespace `app.simt.gnss.*`.
 - **`simt-app`** — `feature:gnss` keeps UI + DI + location/cloud adapters, deletes the
@@ -47,7 +47,7 @@ Two repositories:
 | Source |
 |---|
 | `data/GnssMeasurementProcessor.kt` (the orchestrator, ~2,958 LOC) |
-| new public `GnssEngine` façade + platform mappers + `GnssEngineDiagnostics` |
+| new public `SimtGnssEngine` façade + platform mappers + `SimtGnssEngineDiagnostics` |
 
 ### Stays in `simt-app` (13 files)
 
@@ -82,7 +82,7 @@ renames only — no formula, constant or gating logic changes.
 
 ## 5. Public API (`:gnss-android`)
 
-`GnssEngine` (public) is a thin façade over the public-in-module `internal
+`SimtGnssEngine` (public) is a thin façade over the public-in-module `internal
 GnssMeasurementProcessor`; its names mirror the processor so `simt-app` only swaps the type:
 
 - `processNavigationMessage(GnssNavigationMessage)`
@@ -94,14 +94,14 @@ GnssMeasurementProcessor`; its names mirror the processor so `simt-app` only swa
   `Rtcm3FrameParser` / `RtcmMsmParser` / `Rtcm1005Parser` / `RtcmSsrDecoder`),
   `ssrStore` / `rtkBaseStore`, `describeStoredEphemerides()`,
   `describeFreshEphemerisCoverage(measurements)`
-- `diagnostics(): GnssEngineDiagnostics` (new neutral snapshot type)
+- `diagnostics(): SimtGnssEngineDiagnostics` (new neutral snapshot type)
 
 `ProcessedMeasurements` and `SmoothingMode` were promoted from the processor's nested
 declarations to public top-level types in `app.simt.gnss`; neutral model types
 (`PositionResult`, `SatelliteMeasurement`, `SatelliteEphemeris`, `GnssSolutionMode`) are
 public in `:gnss-core`.
 
-`simt-app` swaps `GnssMeasurementProcessor` → `GnssEngine` and the moved imports;
+`simt-app` swaps `GnssMeasurementProcessor` → `SimtGnssEngine` and the moved imports;
 `core:domain` is untouched.
 
 ## 6. Repository scaffolding
@@ -132,7 +132,7 @@ public in `:gnss-core`.
 2. Copy the 34 engine files + engine tests into the two modules; repackage
    `app.simt.feature.gnss.data.*` → `app.simt.gnss.core.*` / `app.simt.gnss.*`.
 3. Apply the four core seams (§4).
-4. Add the `GnssEngine` façade; make engine types public.
+4. Add the `SimtGnssEngine` façade; make engine types public.
 5. In `simt-app`: rewrite the 13 adapters to import from the library; delete moved code
    with `git rm` (tracked files only — no recursive `rm`); fix imports.
 6. Validate.
@@ -165,7 +165,7 @@ History is not preserved across repos (fresh commits); tests port unchanged.
 | S1 | Complete | none | Scaffold `simt-gnss` Gradle build (`:gnss-core` + `:gnss-android`), wrapper, version catalog, license/readme |
 | S2 | Complete | S1 | Adopt repo with `simt init --yes`; commit scaffold |
 | S3 | Complete | S1 | Port `:gnss-core` sources + tests; apply the four Android-free seams |
-| S4 | Complete | S3 | Port `:gnss-android` processor + tests; add `GnssEngine` façade and `GnssEngineDiagnostics` |
+| S4 | Complete | S3 | Port `:gnss-android` processor + tests; add `SimtGnssEngine` façade and `SimtGnssEngineDiagnostics` |
 | S5 | Complete | S4 | Wire the composite build into `simt-app`; rewrite adapters; `git rm` moved code |
 | S6 | Complete | S5 | Full validation: library tests, anti-coupling grep, `:feature:gnss:testDebugUnitTest`, `:app:assembleDebug` |
 
@@ -183,7 +183,17 @@ History is not preserved across repos (fresh commits); tests port unchanged.
 - **S5** composite build + adapter rewrite — `simt-app` commit `5c84f549e`; 34 sources + 42 tests
   deleted, `GnssLocationServiceImpl` repointed to `app.simt.gnss(.core).*`.
 - **S6** validation — library `./gradlew build` green (core 38 classes / 252 tests,
-  android 7 classes / 40 tests = 292, the 5 extra being the new `GnssEngineTest`); simt-app
+  android 7 classes / 40 tests = 292, the 5 extra being the new `SimtGnssEngineTest`); simt-app
   `:feature:gnss:testDebugUnitTest` 3 classes / 8 tests green; `:app:assembleDebug` green;
   anti-coupling grep over `gnss-core/src` + `gnss-android/src` CLEAN (no `app.simt.core` /
   `app.simt.feature` / androidx / dagger references), and `:gnss-core` has no `android.*` imports.
+
+### Post-extraction changes
+
+- **Façade rename** — the public façade `GnssEngine` was renamed to `SimtGnssEngine`, together
+  with its snapshot type (`GnssEngineDiagnostics` → `SimtGnssEngineDiagnostics`) and its test
+  (`GnssEngineTest` → `SimtGnssEngineTest`), so the public API stays branded to Simt alongside
+  the `app.simt.gnss` package. `simt-app`'s `GnssLocationServiceImpl` was repointed in the same
+  change. Library tests re-verified: `:gnss-core` 38 classes / 252 tests, `:gnss-android`
+  7 classes / 40 tests (292 total, 0 failures); `simt-app` `:feature:gnss:testDebugUnitTest`
+  3 classes / 8 tests green.

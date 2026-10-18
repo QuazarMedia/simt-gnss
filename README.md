@@ -14,7 +14,7 @@ Android app can consume it.
 | Module | Kind | Contents |
 |---|---|---|
 | `:gnss-core` | pure Kotlin/JVM | The algorithms: nav-message and RTCM parsers, orbit/clock computation, solvers (QR, Cholesky, Doppler, RTK double-difference, TDCP), filters (Hatch, Doppler, inter-epoch Kalman), correction models and stores, ephemeris (RINEX) provider, math utilities and the shared data models. No Android dependency — usable for desktop/server post-processing. |
-| `:gnss-android` | Android library | The engine orchestrator (`GnssMeasurementProcessor`) and the public `GnssEngine` façade that binds it to `android.location` types (`GnssMeasurementsEvent`, `GnssNavigationMessage`, `GnssStatus`). |
+| `:gnss-android` | Android library | The engine orchestrator (`GnssMeasurementProcessor`) and the public `SimtGnssEngine` façade that binds it to `android.location` types (`GnssMeasurementsEvent`, `GnssNavigationMessage`, `GnssStatus`). |
 
 `:gnss-android` depends on `:gnss-core`; `:gnss-core` depends on nothing but the Kotlin
 standard library.
@@ -23,7 +23,7 @@ standard library.
 
 ```kotlin
 // from :gnss-android
-val engine = GnssEngine(suppressSbas = false)
+val engine = SimtGnssEngine(suppressSbas = false)
 
 engine.processNavigationMessage(navMessage)                    // feed raw nav messages
 val epoch = engine.processMeasurements(event, gnssStatus)       // feed raw measurements
@@ -39,7 +39,7 @@ val rtk: PositionResult? = engine.computeRtkPosition(epoch.measurements, epoch.g
 ```
 
 All results use neutral model types (`PositionResult`, `SatelliteMeasurement`,
-`SatelliteEphemeris`, `GnssSolutionMode`, `ProcessedMeasurements`, `GnssEngineDiagnostics`)
+`SatelliteEphemeris`, `GnssSolutionMode`, `ProcessedMeasurements`, `SimtGnssEngineDiagnostics`)
 declared in `:gnss-core` / `:gnss-android`. `engine.diagnostics()` returns a neutral snapshot
 for logging or a diagnostics panel.
 

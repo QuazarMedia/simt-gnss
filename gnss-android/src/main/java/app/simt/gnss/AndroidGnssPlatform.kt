@@ -11,7 +11,7 @@ import app.simt.gnss.core.platform.TimeSource
  *
  * The pure-JVM core reads its clock and logger through [GnssPlatform]; on Android those must be
  * backed by `android.os.SystemClock` (monotonic, includes deep sleep) and `android.util.Log`.
- * [GnssEngine] and [GnssMeasurementProcessor] install them on first construction, so every entry
+ * [SimtGnssEngine] and [GnssMeasurementProcessor] install them on first construction, so every entry
  * point into the engine — public façade or internal processor — runs against the Android seams.
  */
 internal object AndroidGnssPlatform {

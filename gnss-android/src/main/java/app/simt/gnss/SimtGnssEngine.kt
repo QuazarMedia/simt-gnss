@@ -32,7 +32,7 @@ import app.simt.gnss.core.solver.GnssPositionSolver
  *   dual-frequency (L1 + L5 / E5) devices, where the iono-free combination is more accurate than
  *   the SBAS grid and decoding the 250 bps stream cannot improve the solution.
  */
-class GnssEngine(
+class SimtGnssEngine(
     suppressSbas: Boolean = false,
 ) {
     private val processor = GnssMeasurementProcessor(suppressSbas)
@@ -137,8 +137,8 @@ class GnssEngine(
     fun ingestRtcmFrame(frame: ByteArray) = rtcmStreamParser.feed(frame)
 
     /** Snapshot of the engine's current state for logging or a diagnostics panel. */
-    fun diagnostics(): GnssEngineDiagnostics =
-        GnssEngineDiagnostics(
+    fun diagnostics(): SimtGnssEngineDiagnostics =
+        SimtGnssEngineDiagnostics(
             storedEphemerides = processor.describeStoredEphemerides(),
             ssrCorrections = processor.ssrStore.describe(),
             rtkBase = processor.rtkBaseStore.describe(),
@@ -164,7 +164,7 @@ class GnssEngine(
 }
 
 /**
- * Neutral snapshot of a [GnssEngine]'s current state.
+ * Neutral snapshot of a [SimtGnssEngine]'s current state.
  *
  * @property storedEphemerides human-readable summary of the held ephemerides.
  * @property ssrCorrections human-readable summary of the SSR correction store.
@@ -172,7 +172,7 @@ class GnssEngine(
  * @property rtkBaseFresh `true` when the base store holds enough fresh observations for RTK.
  * @property lastSolution the most recent solution produced by the engine, if any.
  */
-data class GnssEngineDiagnostics(
+data class SimtGnssEngineDiagnostics(
     val storedEphemerides: String,
     val ssrCorrections: String,
     val rtkBase: String,
