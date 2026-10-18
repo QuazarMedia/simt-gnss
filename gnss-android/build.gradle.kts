@@ -52,7 +52,8 @@ val javadocJar by tasks.registering(Jar::class) {
 }
 
 // Coordinates and POM come from the root build file; the upload is done by nmcp. The `release`
-// component only exists once AGP has created it, hence `afterEvaluate`.
+// component only exists once AGP has created it, hence `afterEvaluate`. Signing is wired in the
+// same block: signing earlier would look up a publication that does not exist yet.
 afterEvaluate {
     publishing {
         publications {
@@ -62,15 +63,15 @@ afterEvaluate {
             }
         }
     }
-}
 
-// Maven Central rejects unsigned artifacts, so the release workflow must supply a key. Kept
-// conditional so a plain `./gradlew build` still works without one.
-signing {
-    val signingKey: String? = providers.gradleProperty("signingKey").orNull
-    val signingPassword: String? = providers.gradleProperty("signingPassword").orNull
-    if (signingKey != null && signingPassword != null) {
-        useInMemoryPgpKeys(signingKey, signingPassword)
-        sign(publishing.publications["release"])
+    // Maven Central rejects unsigned artifacts, so the release workflow must supply a key. Kept
+    // conditional so a plain `./gradlew build` still works without one.
+    signing {
+        val signingKey: String? = providers.gradleProperty("signingKey").orNull
+        val signingPassword: String? = providers.gradleProperty("signingPassword").orNull
+        if (signingKey != null && signingPassword != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+            sign(publishing.publications["release"])
+        }
     }
 }
