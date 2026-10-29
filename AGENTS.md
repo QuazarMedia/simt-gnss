@@ -1,6 +1,6 @@
 <!-- simt:begin -->
 <!-- simt:generated -->
-<!-- simt:sha=e64c69c548517daaa897c8b18aa9f9903d22e20b -->
+<!-- simt:sha=29be4d70e0b1b3025591c241324bcebbfa912240 -->
 <!-- simt:sources=rules/core.md,rules/stacks/android.md,rules/stacks/jvm.md,rules/mdc/intake-questions.mdc,rules/mdc/slice-commit.mdc,rules/mdc/test-gate.mdc -->
 <!-- Generated content. Do not edit by hand - your changes are overwritten.
      Run `simt sync --yes` to regenerate, or `simt check` to see what is stale. -->
@@ -92,17 +92,17 @@ this profile; see `jvm`.
 
 ### Modules and layers
 
-- `:core:domain` depends on no other internal module. Enforce it; do not add an
+- The core domain module depends on no other internal module. Enforce it; do not add an
   import that breaks the direction.
 - Layer suffixes: `*Repository`, `*ViewModel`, `*UiState`, `*Screen`, `*Service`.
-- Feature modules never import `androidx.compose.ui.window.Dialog`, M3 `AlertDialog`
-  or M3 `ModalBottomSheet`. The raw `Dialog` window belongs to allowlisted `core:ui`
-  surfaces, and `checkOverlayModalPolicy` fails `./gradlew check` when a feature
-  bypasses it.
+- Feature modules never present a raw `Dialog` window (`androidx.compose.ui.window.Dialog`,
+  M3 `AlertDialog`, M3 `ModalBottomSheet`) that bypasses the shared modal policy.
+  Modals go through the design system's dialog surfaces, and the repo's check fails
+  the build on a bypass.
 
 ### Accessibility
 
-- Every user-facing string is a resource, with a `cd_` content description where an
+- Every user-facing string is a resource, with a content description where an
   icon or image carries meaning. Decorative images declare `contentDescription = null`
   explicitly.
 - Touch targets meet the platform minimum, and the minimum is asserted rather than
@@ -126,8 +126,7 @@ this profile; see `jvm`.
 
 - Unit tests for view models, repositories and mappers; instrumentation tests for UI.
 - `Dispatchers.setMain` in a `@BeforeTest`, restored in `@AfterTest`.
-- Assert behaviour, not implementation. Never weaken an assertion, an accessibility
-  check or a fixture to match current behaviour.
+- Assert behaviour, not implementation — including accessibility checks and fixtures. Never weaken one to match current behaviour.
 
 ## Stack: jvm
 
@@ -145,7 +144,7 @@ rules live in the `android` profile, which selects on `has-android-manifest`.
 
 ### Modules and layers
 
-- `:core:domain` depends on no other internal module. Enforce it; do not add an
+- The core domain module depends on no other internal module. Enforce it; do not add an
   import that breaks the direction.
 - Layer suffixes: `*Repository`, `*Service`, `*Mapper`, `*Controller`. A class named
   `*Repository` that talks to HTTP is not a repository.
@@ -179,6 +178,8 @@ Commands for this repository:
 - build: `./gradlew build`
 - focused test (Android): `./gradlew :{module}:testDebugUnitTest --tests {class}`
 - focused test (JVM): `./gradlew test --tests {class}`
+
+New task? Run `simt brief "<task>"` before exploring; before editing a file, `simt why <file>`.
 
 ## Process: intake-questions
 

@@ -80,3 +80,6 @@ git.config
 
 # JS tooling (simt-dev gate)
 node_modules/
+
+# Write journal for `simt undo`. Local state, never shared.
+.simt/journal/
