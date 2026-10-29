@@ -81,5 +81,7 @@ git.config
 # JS tooling (simt-dev gate)
 node_modules/
 
-# Write journal for `simt undo`. Local state, never shared.
-.simt/journal/
+# simt-dev runtime state (per-developer; never shared): journal, evidence ledger,
+# index cache, benchmark runs, local-model proposals. Nothing in here is committed,
+# so ignore the whole directory rather than tracking its ever-growing file list.
+.simt/
