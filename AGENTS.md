@@ -1,6 +1,6 @@
 <!-- simt:begin -->
 <!-- simt:generated -->
-<!-- simt:sha=29be4d70e0b1b3025591c241324bcebbfa912240 -->
+<!-- simt:sha=cadbf6fb6c388f2f81fedab31b78d4e5e240ead2 -->
 <!-- simt:sources=rules/core.md,rules/stacks/android.md,rules/stacks/jvm.md,rules/mdc/intake-questions.mdc,rules/mdc/slice-commit.mdc,rules/mdc/test-gate.mdc -->
 <!-- Generated content. Do not edit by hand - your changes are overwritten.
      Run `simt sync --yes` to regenerate, or `simt check` to see what is stale. -->
@@ -24,9 +24,16 @@ commands belongs in this repository, not here.
 
 ### Git
 
+The commit and push procedure - order, message format, worktrees - is the `slice-commit`
+rule; follow it for every commit and push.
+
 - Commit locally, report the SHA. **Push only on explicit approval.** (ADR-001)
 - Before asking for push approval, state whether the push triggers a deployment, a migration
   or any remote mutation.
+- Once approved, you may push directly without the pre-push gate re-running the full suite
+  when you already ran that suite green on the current state and changed nothing since: cite
+  the already-passing run as the pass, and the gate recognizes the evidence and skips the
+  re-run rather than paying for it again. (ADR-120)
 - Never use `--no-verify`, amend, rebase, reset or rewrite history unless explicitly asked.
 - Never commit failing, partial, secret-bearing or unrelated work.
 
@@ -45,8 +52,8 @@ commands belongs in this repository, not here.
 - Name the exact commands and test files. Partial pass is a blocker; `6/8 pass` is the
   canonical example of a blocked state. Never justify a skip without a pre-existing written
   reason. (ADR-006)
-- Evidence discipline is mandatory everywhere. A **numeric** bar is declared per repo in
-  `simt-dev.json`, never assumed centrally. (ADR-006)
+- Evidence discipline is mandatory everywhere. A **numeric** bar is declared per repo in the
+  repository's manifest (`simt.json`), never assumed centrally. (ADR-006)
 - The pre-commit hook owns format and lint for staged files; do not re-run what it just ran.
   Manual runs are correct when the hook is absent, when diagnosing a failure, or for a check
   the hook does not cover. (ADR-004)
@@ -59,7 +66,7 @@ commands belongs in this repository, not here.
 ### Code and review
 
 - No type-system escapes, no unawaited async work, no debug printing in application code.
-- Enforced: max-file-lines
+- Enforced: by `simt check`: more than 400 lines warns, more than 1000 fails (`limits.fileLines`)
 - Never weaken CSP, CORS, auth, audit, cache or validation controls to silence a test, warning
   or alert.
 - Review verdicts are exactly three: `BLOCK`, `APPROVE WITH RESIDUAL RISK` (must list what was
@@ -77,9 +84,9 @@ repository's rule, not a widening of this one.
 
 ## Stack: android
 
-Applies to: `has-android-manifest` — some module has a
-`src/main/AndroidManifest.xml`. A JVM backend with no Android module does not get
-this profile; see `jvm`.
+Applies to: Android modules — some module has a `src/main/AndroidManifest.xml`.
+A JVM backend with no Android module does not get this profile; see `simt rules
+show jvm`.
 
 ### Build
 
@@ -130,8 +137,9 @@ this profile; see `jvm`.
 
 ## Stack: jvm
 
-Applies to: `gradle`, `has-maven-pom`, `kotlin`, `java` — a JVM build. The Android
-rules live in the `android` profile, which selects on `has-android-manifest`.
+Applies to: a JVM build — `gradle`, a committed `pom.xml`, Kotlin or Java. The
+Android rules live in the `android` profile (`simt rules show android`), which
+selects when an `AndroidManifest.xml` is present.
 
 ### Build
 
@@ -209,6 +217,14 @@ the list to reach it, and never split one decision into several questions to fit
 - If that is not available, present numbered choices with `(recommended)` on the first option.
 - Do not ask operational or procedural choices; apply the best documented option.
 
+### Small work (no plan file)
+
+When the whole of the work is small — fewer than three slices — do not create a plan file.
+Plan it and implement it directly, in a single slice: state the slice and its acceptance
+checks, resolve any material decisions, and build it. The `docs/plans/*` tracker table and
+its `NNNN-slug.md` deliverable are for work that spans multiple slices; a single slice has
+nothing to track. The slice-commit procedure still applies to the one commit it produces.
+
 ### Required First Turn
 
 1. State the smallest independently valuable slice, the owning repo, the active plan
@@ -224,6 +240,35 @@ one is a mechanical procedure with a fixed order, because every step after it de
 on the one before: you cannot review a diff you have not staged, and you cannot claim
 evidence for a test you have not run.
 
+### Commit message
+
+A message is read by the next agent before they are told what to do. It says what the
+commit is, what it answers, and what it changed, so a reader never reconstructs that
+from the diff.
+
+The title is Conventional Commits: imperative, no trailing period, a short scope slug
+that names the subsystem — not a ticket id.
+
+    feat(dispatcher): skip the test gate on a push that already passed
+
+The body is plain sections in this order. Drop any section that has nothing to say; a
+one-line commit needs none of them.
+
+    What: <one sentence — what this commit is>
+    Why: <what it answers — the task, defect, or decision that asked for it>
+    Before: <the state this replaces, briefly>
+    After: <the state it leaves, briefly>
+
+"Before" and "After" are a short state summary, not a diff: enough to see what moved,
+not enough to need the patch. Cite a decision record where one settles the change, and
+never claim a test in the body that was not run on this tree.
+
+The message ends with a trailer on its own line, after the body - attribution to the
+tool, in the form git renders as a co-author. It is part of the message, not a
+section, so it stays even when every section is dropped:
+
+    Co-Authored-By: Simt Dev <noreply@simt.space>
+
 ### Order
 
 1. **Run the focused test the change needs**, through the repository's own runner,
@@ -233,10 +278,8 @@ evidence for a test you have not run.
    alone. Report what you left alone; silence about it reads as "I reverted it".
 3. **Read the staged diff.** Not the working tree — the diff. It is what will be
    committed, and it is the last chance to notice a file that does not belong.
-4. **Write the message.** Conventional Commits, imperative subject, no trailing period:
-   `fix(gates): declare only gates a repo can run, and report the ones it cannot`.
-   The subject says what changed; the body says why, and what was deliberately not
-   changed.
+4. **Write the message in the format above.** The title names what changed; the body
+   says why, and what was deliberately not changed.
 5. **Commit.** `git commit`, non-interactive. Report the SHA.
 6. **Stop.**
 
@@ -252,6 +295,32 @@ mutation. Then wait. Approval to commit is not approval to push.
 Never use `--no-verify`. A hook that fails is telling you something about the change;
 skipping it turns a gate into a suggestion and the next person has no way to know it
 was skipped.
+
+Once the push is approved, you may push directly without the pre-push gate re-running
+the full suite when you already ran that suite green on the current state and changed
+nothing since: the gate records every run against the tree it ran on, recognises that
+evidence, and skips the re-run, reporting the skip and the record that earned it.
+Cite the already-passing run as the pass — do not claim a re-run that did not happen.
+(ADR-120)
+
+### Worktrees
+
+A worktree is the unit of isolation for concurrent work. The rules that keep it honest:
+
+- **One agent, one worktree, one slice.** Never direct two agents at the same files
+  concurrently; give each its own worktree and a slice whose files do not overlap.
+- **Start from the record, not from memory.** `simt slice start <id>` creates the
+  worktree for the tracker row and returns its path; work in that path, not the main
+  checkout.
+- **Finish where you started.** `simt slice finish <id>` runs the declared gates and
+  commits from the worktree; `simt plan done <id> <sha>` records the SHA in the main
+  checkout's tracker. A slice is not done when its worktree is green — it is done
+  when the tracker row is complete and the SHA is recorded.
+- **Leave the worktree when the slice is done.** A finished worktree that still holds
+  a dirty tree is a claim about work that is not committed; remove it, and report what
+  you left behind if there was any.
+- **Never rewrite history across worktrees.** A rebase, reset or amend in one worktree
+  changes the base every other worktree branched from; coordinate it, or do not do it.
 
 ### What never belongs in a commit
 
