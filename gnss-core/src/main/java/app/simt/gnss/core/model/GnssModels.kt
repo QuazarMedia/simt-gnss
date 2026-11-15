@@ -1,5 +1,7 @@
 package app.simt.gnss.core.model
 
+import app.simt.gnss.core.utils.GnssMathUtils
+
 /**
  * Data class representing a processed single-satellite measurement.
  */
@@ -28,6 +30,8 @@ data class SatelliteMeasurement(
     /** Uncorrected pseudorange rate. NaN when the platform did not provide one. */
     val pseudorangeRateMetersPerSecond: Double = Double.NaN,
     val pseudorangeRateUncertaintyMetersPerSecond: Double = Double.NaN,
+    /** Number of smoother epochs accumulated on this signal (`1` on unsmoothed/reset epochs). */
+    val smoothingEpochs: Int = GnssMathUtils.HATCH_FILTER_MAX_SMOOTHING.toInt(),
 )
 
 /** How a [PositionResult] was solved. */

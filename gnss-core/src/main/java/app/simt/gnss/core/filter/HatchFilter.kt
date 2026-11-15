@@ -21,7 +21,11 @@ class HatchFilter {
     private val lastRaw = mutableMapOf<Triple<Int, Int, Int>, Double>()
     private val lastEpochNanos = mutableMapOf<Triple<Int, Int, Int>, Long>()
     private val lastUpdatedEpoch = mutableMapOf<Triple<Int, Int, Int>, Long>()
+    private val lastFullBiasNanos = mutableMapOf<Triple<Int, Int, Int>, Long>()
+    private val lastBiasNanos = mutableMapOf<Triple<Int, Int, Int>, Double>()
     private var measurementEpoch: Long = 0L
+
+    fun currentSmoothingCount(signalKey: Triple<Int, Int, Int>): Int = smoothingCount[signalKey] ?: 1
 
     /**
      * Call once at the start of each measurement epoch to age out signals
@@ -44,6 +48,8 @@ class HatchFilter {
         lastRaw.remove(signalKey)
         lastEpochNanos.remove(signalKey)
         lastUpdatedEpoch.remove(signalKey)
+        lastFullBiasNanos.remove(signalKey)
+        lastBiasNanos.remove(signalKey)
     }
 
     /**
@@ -55,12 +61,12 @@ class HatchFilter {
      *   -style epochs. Monotonic within a session, which is all the prediction needs.
      * @param pseudorangeRateMetersPerSecond the platform's own range rate for this signal.
      * @param pseudorangeRateUncertaintyMetersPerSecond its 1-sigma, which widens the slip tolerance.
-     * @param clockStepMeters the receiver clock correction's change since the previous epoch, in
-     *   metres of range, from [receiverClockStepMeters]. Subtracted from the propagation and from
-     *   the code-consistency residual, because the pseudorange is clock-corrected and the carrier is
-     *   not.
+     * @param clockStepMeters fallback receiver clock step in metres when [fullBiasNanos] is null.
      * @param codeSigmaMeters reported code uncertainty, in metres. Widens the consistency limit
      *   above [GnssMathUtils.ADR_CODE_CONSISTENCY_THRESHOLD_METERS]; zero keeps that floor.
+     * @param fullBiasNanos current epoch's `fullBiasNanos`, tracked per [signalKey] so signals
+     *   returning from brief occlusion subtract the exact cumulative clock step since last seen.
+     * @param biasNanos sub-nanosecond receiver clock bias paired with [fullBiasNanos].
      */
     fun smooth(
         signalKey: Triple<Int, Int, Int>,
@@ -70,8 +76,10 @@ class HatchFilter {
         epochTimeNanos: Long,
         pseudorangeRateMetersPerSecond: Double,
         pseudorangeRateUncertaintyMetersPerSecond: Double,
-        clockStepMeters: Double,
+        clockStepMeters: Double = 0.0,
         codeSigmaMeters: Double = 0.0,
+        fullBiasNanos: Long? = null,
+        biasNanos: Double = 0.0,
     ): Double {
         val hasValidAdr = currentAdr != null && (adrState and AdrState.VALID) != 0
 
@@ -84,6 +92,17 @@ class HatchFilter {
         val prevAdr = lastAdr[signalKey]
         val prevRaw = lastRaw[signalKey]
         val count = smoothingCount[signalKey] ?: 0
+        val effectiveClockStepMeters =
+            if (fullBiasNanos != null) {
+                receiverClockStepMeters(
+                    lastFullBiasNanos[signalKey],
+                    fullBiasNanos,
+                    lastBiasNanos[signalKey] ?: 0.0,
+                    biasNanos,
+                )
+            } else {
+                clockStepMeters
+            }
 
         // The seconds since this signal was last seen, which is the interval the Doppler prediction
         // below is integrated over. Zero or negative means the caller went backwards or repeated an
@@ -92,6 +111,7 @@ class HatchFilter {
             lastEpochNanos[signalKey]?.let { previousNanos ->
                 (epochTimeNanos - previousNanos).toDouble() / GnssMathUtils.NANOS_PER_SECOND.toDouble()
             }?.takeIf { it > 0.0 && it <= GnssMathUtils.DOPPLER_MAX_DT_SECONDS }
+        val hasGap = prevAdr != null && dtSeconds == null
 
         // Cycle slip / rebase detection. Three independent sources, because each one covers a case
         // the others cannot see:
@@ -152,7 +172,7 @@ class HatchFilter {
         // and the remaining common-mode residue is the receiver clock's own sub-nanosecond wobble.)
         val codeResidualMeters =
             if (prevAdr != null && prevRaw != null) {
-                abs((currentAdr - prevAdr - clockStepMeters) - (rawPseudorange - prevRaw))
+                abs((currentAdr - prevAdr - effectiveClockStepMeters) - (rawPseudorange - prevRaw))
             } else {
                 null
             }
@@ -166,6 +186,7 @@ class HatchFilter {
         val isCycleSlip =
             (adrState and AdrState.CYCLE_SLIP) != 0 ||
                 (adrState and AdrState.RESET) != 0 ||
+                hasGap ||
                 dopplerSlip ||
                 (codeResidualMeters != null && codeResidualMeters > consistencyLimit)
 
@@ -196,9 +217,9 @@ class HatchFilter {
                 // per-satellite bias. That is the whole of the correction, and it is why the term is
                 // taken out here per signal rather than relied upon downstream.
                 weight * rawPseudorange +
-                    (1.0 - weight) * (prevSmoothed + (currentAdr - prevAdr) - clockStepMeters)
+                    (1.0 - weight) * (prevSmoothed + (currentAdr - prevAdr) - effectiveClockStepMeters)
             } else {
-                smoothingCount[signalKey] = 0 // Reset convergence on cycle slip
+                smoothingCount[signalKey] = 0 // Reset convergence on cycle slip or signal gap
                 rawPseudorange
             }
 
@@ -208,6 +229,13 @@ class HatchFilter {
         lastRaw[signalKey] = rawPseudorange
         lastEpochNanos[signalKey] = epochTimeNanos
         lastUpdatedEpoch[signalKey] = measurementEpoch
+        if (fullBiasNanos != null) {
+            lastFullBiasNanos[signalKey] = fullBiasNanos
+            lastBiasNanos[signalKey] = biasNanos
+        } else {
+            lastFullBiasNanos.remove(signalKey)
+            lastBiasNanos.remove(signalKey)
+        }
         return smoothed
     }
 
@@ -218,6 +246,8 @@ class HatchFilter {
         lastRaw.clear()
         lastEpochNanos.clear()
         lastUpdatedEpoch.clear()
+        lastFullBiasNanos.clear()
+        lastBiasNanos.clear()
         measurementEpoch = 0L
     }
 }

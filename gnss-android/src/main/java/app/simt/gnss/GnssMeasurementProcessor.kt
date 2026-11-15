@@ -900,9 +900,10 @@ internal class GnssMeasurementProcessor(
             val adr = meas.accumulatedDeltaRangeMeters ?: continue
             if (!hasValidAdr(meas.adrState) || isCarrierHalfCycleAmbiguous(meas.adrState)) continue
             val key = meas.constellationType to meas.svid
-            if (!seen.add(key)) continue
+            if (key in seen) continue
             val previous = tdcpSignals[key] ?: continue
             if (abs(previous.frequencyHz - meas.carrierFrequencyHz) > 1_000.0) continue
+            seen.add(key)
             val agrees =
                 carrierDeltaMatchesPseudorangeRate(
                     currentAdrMeters = adr,
@@ -1218,11 +1219,12 @@ internal class GnssMeasurementProcessor(
                                 pseudorangeRateMetersPerSecond = measurement.pseudorangeRateMetersPerSecond,
                                 pseudorangeRateUncertaintyMetersPerSecond = measurement.pseudorangeRateUncertaintyMetersPerSecond,
                                 // The pseudorange above is clock-corrected and the carrier is not, so
-                                // the filter is told the correction's step or it will read the receiver's
-                                // own refit as a carrier-versus-code disagreement and as a step it must
-                                // propagate.
+                                // the filter tracks fullBiasNanos per signal to subtract the exact
+                                // cumulative clock step even across brief signal occlusions.
                                 clockStepMeters = clockStepMeters,
                                 codeSigmaMeters = codeSigmaMeters,
+                                fullBiasNanos = if (hasFullBias) clock.fullBiasNanos else null,
+                                biasNanos = biasNanos,
                             )
                         SmoothingMode.DOPPLER ->
                             dopplerSmoother.smooth(
@@ -1231,12 +1233,17 @@ internal class GnssMeasurementProcessor(
                                 pseudorangeRateMetersPerSecond = measurement.pseudorangeRateMetersPerSecond,
                                 pseudorangeRateUncertaintyMetersPerSecond = measurement.pseudorangeRateUncertaintyMetersPerSecond,
                                 epochTimeNanos = gpsTimeNanos,
-                                // Same reason, same number: the prediction is built from an uncorrected
-                                // rate and an already-corrected pseudorange, and without the step the two
-                                // differ by a whole correction — which on a refitting receiver is 100 m,
-                                // so this smoother was adding error rather than removing it.
+                                // Same reason: track fullBiasNanos per signal so the prediction
+                                // stays in the pseudorange's clock domain across brief occlusions.
                                 clockStepMeters = clockStepMeters,
+                                fullBiasNanos = if (hasFullBias) clock.fullBiasNanos else null,
+                                biasNanos = biasNanos,
                             )
+                    }
+                val smoothingEpochs =
+                    when (smoothingMode) {
+                        SmoothingMode.CARRIER_HATCH -> hatchFilter.currentSmoothingCount(signalKey)
+                        SmoothingMode.DOPPLER -> dopplerSmoother.currentSmoothingCount(signalKey).coerceAtMost(DOPPLER_EFFECTIVE_MAX_SMOOTHING_EPOCHS)
                     }
 
                 val wavelength = SPEED_OF_LIGHT / measurement.carrierFrequencyHz
@@ -1261,6 +1268,7 @@ internal class GnssMeasurementProcessor(
                         adrState = adrState,
                         pseudorangeRateMetersPerSecond = measurement.pseudorangeRateMetersPerSecond,
                         pseudorangeRateUncertaintyMetersPerSecond = measurement.pseudorangeRateUncertaintyMetersPerSecond,
+                        smoothingEpochs = smoothingEpochs,
                     ),
                 )
 
@@ -1864,7 +1872,7 @@ internal class GnssMeasurementProcessor(
                                 GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
                                 GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
                             )
-                        val sigmaModel = GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(iterElevationDeg, meas.cn0DbHz)
+                        val sigmaModel = GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(iterElevationDeg, meas.cn0DbHz, meas.smoothingEpochs)
                         val sigmaCode =
                             max(sigmaAndroid, sigmaModel).coerceIn(
                                 GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
@@ -2097,7 +2105,6 @@ internal class GnssMeasurementProcessor(
                             clearTdcp()
                             null
                         }
-                    val anchor = tdcpAnchor
                     val (outX, outY, outZ) =
                         if (gpsTimeNanos > 0L) {
                             // Measurement covariance for the Kalman = a-posteriori variance factor ×
@@ -2114,19 +2121,9 @@ internal class GnssMeasurementProcessor(
                                 rMeas,
                                 gpsTimeNanos,
                                 velocityEcef = doppler?.let { Triple(it.velocityX, it.velocityY, it.velocityZ) },
-                                velocityVarianceM2PerS2 = doppler?.let { Triple(it.varianceX, it.varianceY, it.varianceZ) },
-                                displacementEcef =
-                                    if (displacement == null || anchor == null) {
-                                        null
-                                    } else {
-                                        Triple(
-                                            anchor.first + displacement.deltaX,
-                                            anchor.second + displacement.deltaY,
-                                            anchor.third + displacement.deltaZ,
-                                        )
-                                    },
-                                displacementVarianceM2 =
-                                    displacement?.let { Triple(it.varianceX, it.varianceY, it.varianceZ) },
+                                velocityCovarianceM2PerS2 = doppler?.covarianceEcef,
+                                relativeDisplacementEcef = displacement?.let { Triple(it.deltaX, it.deltaY, it.deltaZ) },
+                                relativeDisplacementCovarianceM2 = displacement?.covarianceEcef,
                             )
                         } else {
                             interEpochKalman.reset()
@@ -2895,6 +2892,7 @@ internal class GnssMeasurementProcessor(
     companion object {
         private const val TAG = "GnssMeasurementProcessor"
         private const val MAX_PSEUDORANGE_RATE_SIGMA_MPS = 5.0
+        private const val DOPPLER_EFFECTIVE_MAX_SMOOTHING_EPOCHS = 9
 
         /**
          * When [android.location.GnssStatus] has not yet reported this SV, elevation defaults to 0° in the

@@ -244,6 +244,50 @@ class DopplerSmootherTest {
         )
     }
 
+    @Test
+    fun signalDroppingOutAcrossClockRefit_subtractsCumulativeClockStepWithoutBias() {
+        val smoother = DopplerSmoother()
+        val signalA = Triple(6, 7, 1575)
+        val signalB = Triple(6, 12, 1575)
+        val startNanos = 8_000_000_000L
+        val refitNanos = 334L
+        val refitMeters = refitNanos.toDouble() / GnssMathUtils.NANOS_PER_SECOND * GnssMathUtils.SPEED_OF_LIGHT
+        val fullBias0 = 1_400_000_000_000_000_000L
+        val fullBias1 = fullBias0 + refitNanos
+        val fullBias2 = fullBias1
+
+        smoother.beginNewMeasurementsEpoch()
+        smoother.smooth(signalA, START_RANGE, -RANGE_RATE_MPS, RATE_SIGMA_MPS, startNanos, fullBiasNanos = fullBias0)
+        smoother.smooth(signalB, START_RANGE + 1_000.0, -RANGE_RATE_MPS, RATE_SIGMA_MPS, startNanos, fullBiasNanos = fullBias0)
+
+        // Epoch 1: Signal A sees the 100 m clock refit; Signal B is occluded
+        smoother.beginNewMeasurementsEpoch()
+        smoother.smooth(
+            signalA,
+            START_RANGE - RANGE_RATE_MPS - refitMeters,
+            -RANGE_RATE_MPS,
+            RATE_SIGMA_MPS,
+            startNanos + GnssMathUtils.NANOS_PER_SECOND,
+            fullBiasNanos = fullBias1,
+        )
+
+        // Epoch 2: Signal B returns; global step at Epoch 2 is 0 m, cumulative step since Epoch 0 is ~100 m
+        smoother.beginNewMeasurementsEpoch()
+        val bClean = START_RANGE + 1_000.0 - 2.0 * RANGE_RATE_MPS - refitMeters
+        val bOut =
+            smoother.smooth(
+                signalB,
+                bClean + CODE_NOISE_METERS,
+                -RANGE_RATE_MPS,
+                RATE_SIGMA_MPS,
+                startNanos + 2 * GnssMathUtils.NANOS_PER_SECOND,
+                fullBiasNanos = fullBias2,
+            )
+        // Expected: alpha * (bClean + CODE_NOISE) + (1 - alpha) * bClean = bClean + 0.2 * CODE_NOISE
+        assertEquals(bClean + GnssMathUtils.DOPPLER_SMOOTHING_ALPHA * CODE_NOISE_METERS, bOut, 1e-6)
+        assertEquals(2, smoother.currentSmoothingCount(signalB))
+    }
+
     private fun whiteNoiseMeters(
         epoch: Int,
         amplitude: Double,

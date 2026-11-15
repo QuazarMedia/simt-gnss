@@ -17,6 +17,7 @@ object TdcpDisplacementSolver {
     const val RESIDUAL_FLOOR_METERS = 0.10
     private const val RESIDUAL_SIGMA = 4.0
     const val SIGMA_METERS = 0.02
+    const val MIN_DISPLACEMENT_VARIANCE_M2 = 1e-4
 
     data class Satellite(
         val losX: Double,
@@ -37,6 +38,12 @@ object TdcpDisplacementSolver {
         val varianceX: Double,
         val varianceY: Double,
         val varianceZ: Double,
+        val covarianceEcef: Array<DoubleArray> =
+            arrayOf(
+                doubleArrayOf(varianceX, 0.0, 0.0),
+                doubleArrayOf(0.0, varianceY, 0.0),
+                doubleArrayOf(0.0, 0.0, varianceZ),
+            ),
     )
 
     fun solve(
@@ -66,6 +73,7 @@ object TdcpDisplacementSolver {
                 observations,
                 residualFloor = RESIDUAL_FLOOR_METERS,
                 residualSigma = RESIDUAL_SIGMA,
+                minVariance = MIN_DISPLACEMENT_VARIANCE_M2,
             ) ?: return null
         return Displacement(
             deltaX = solved.velocityX,
@@ -74,6 +82,7 @@ object TdcpDisplacementSolver {
             varianceX = solved.varianceX,
             varianceY = solved.varianceY,
             varianceZ = solved.varianceZ,
+            covarianceEcef = solved.covarianceEcef,
         )
     }
 }

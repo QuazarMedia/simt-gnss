@@ -14,9 +14,14 @@ import kotlin.math.abs
  */
 class DopplerSmoother {
     private val smoothedPseudoranges = mutableMapOf<Triple<Int, Int, Int>, Double>()
+    private val smoothingCount = mutableMapOf<Triple<Int, Int, Int>, Int>()
     private val lastEpochNanos = mutableMapOf<Triple<Int, Int, Int>, Long>()
     private val lastUpdatedEpoch = mutableMapOf<Triple<Int, Int, Int>, Long>()
+    private val lastFullBiasNanos = mutableMapOf<Triple<Int, Int, Int>, Long>()
+    private val lastBiasNanos = mutableMapOf<Triple<Int, Int, Int>, Double>()
     private var measurementEpoch: Long = 0L
+
+    fun currentSmoothingCount(signalKey: Triple<Int, Int, Int>): Int = smoothingCount[signalKey] ?: 1
 
     /**
      * Call once at the start of each measurement epoch to evict stale state.
@@ -29,19 +34,25 @@ class DopplerSmoother {
             smoothedPseudoranges.keys.filter { key ->
                 (lastUpdatedEpoch[key] ?: Long.MIN_VALUE) < minKeep
             }
-        staleKeys.forEach { signalKey ->
-            smoothedPseudoranges.remove(signalKey)
-            lastEpochNanos.remove(signalKey)
-            lastUpdatedEpoch.remove(signalKey)
-        }
+        staleKeys.forEach { removeSignalKey(it) }
+    }
+
+    private fun removeSignalKey(signalKey: Triple<Int, Int, Int>) {
+        smoothedPseudoranges.remove(signalKey)
+        smoothingCount.remove(signalKey)
+        lastEpochNanos.remove(signalKey)
+        lastUpdatedEpoch.remove(signalKey)
+        lastFullBiasNanos.remove(signalKey)
+        lastBiasNanos.remove(signalKey)
     }
 
     /**
      * Smooth one signal's pseudorange for one epoch.
      *
-     * @param clockStepMeters the receiver clock correction's change since the previous epoch, in
-     *   metres of range, from [receiverClockStepMeters]. Subtracted from the prediction, because
-     *   the pseudorange is corrected by the clock and the reported rate is not.
+     * @param clockStepMeters fallback receiver clock step in metres when [fullBiasNanos] is null.
+     * @param fullBiasNanos current epoch's `fullBiasNanos`, tracked per [signalKey] so signals
+     *   returning from brief occlusion subtract the exact cumulative clock step since last seen.
+     * @param biasNanos sub-nanosecond receiver clock bias paired with [fullBiasNanos].
      */
     fun smooth(
         signalKey: Triple<Int, Int, Int>,
@@ -49,7 +60,9 @@ class DopplerSmoother {
         pseudorangeRateMetersPerSecond: Double,
         pseudorangeRateUncertaintyMetersPerSecond: Double,
         epochTimeNanos: Long,
-        clockStepMeters: Double,
+        clockStepMeters: Double = 0.0,
+        fullBiasNanos: Long? = null,
+        biasNanos: Double = 0.0,
     ): Double {
         val rateIsReliable =
             isPseudorangeRateReliable(
@@ -59,7 +72,19 @@ class DopplerSmoother {
 
         val previousSmoothed = smoothedPseudoranges[signalKey]
         val previousEpoch = lastEpochNanos[signalKey]
+        val effectiveClockStepMeters =
+            if (fullBiasNanos != null) {
+                receiverClockStepMeters(
+                    lastFullBiasNanos[signalKey],
+                    fullBiasNanos,
+                    lastBiasNanos[signalKey] ?: 0.0,
+                    biasNanos,
+                )
+            } else {
+                clockStepMeters
+            }
 
+        var usedSmoothed = false
         val smoothed =
             if (rateIsReliable && previousSmoothed != null && previousEpoch != null) {
                 val dtSeconds = (epochTimeNanos - previousEpoch).toDouble() / GnssMathUtils.NANOS_PER_SECOND.toDouble()
@@ -82,11 +107,12 @@ class DopplerSmoother {
                     // spread where a common-mode term belongs. Same domain on both sides is the fix;
                     // the gate itself is unchanged.
                     val predicted =
-                        previousSmoothed + pseudorangeRateMetersPerSecond * dtSeconds - clockStepMeters
+                        previousSmoothed + pseudorangeRateMetersPerSecond * dtSeconds - effectiveClockStepMeters
                     val alpha = GnssMathUtils.DOPPLER_SMOOTHING_ALPHA
                     val candidate = alpha * rawPseudorange + (1.0 - alpha) * predicted
 
                     if (abs(candidate - rawPseudorange) <= GnssMathUtils.DOPPLER_MAX_RAW_DEVIATION_METERS) {
+                        usedSmoothed = true
                         candidate
                     } else {
                         rawPseudorange
@@ -98,16 +124,27 @@ class DopplerSmoother {
                 rawPseudorange
             }
 
+        smoothingCount[signalKey] = if (usedSmoothed) (smoothingCount[signalKey] ?: 1) + 1 else 1
         smoothedPseudoranges[signalKey] = smoothed
         lastEpochNanos[signalKey] = epochTimeNanos
         lastUpdatedEpoch[signalKey] = measurementEpoch
+        if (fullBiasNanos != null) {
+            lastFullBiasNanos[signalKey] = fullBiasNanos
+            lastBiasNanos[signalKey] = biasNanos
+        } else {
+            lastFullBiasNanos.remove(signalKey)
+            lastBiasNanos.remove(signalKey)
+        }
         return smoothed
     }
 
     fun reset() {
         smoothedPseudoranges.clear()
+        smoothingCount.clear()
         lastEpochNanos.clear()
         lastUpdatedEpoch.clear()
+        lastFullBiasNanos.clear()
+        lastBiasNanos.clear()
         measurementEpoch = 0L
     }
 }
