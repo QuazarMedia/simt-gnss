@@ -554,6 +554,7 @@ object BroadcastEphemerisProvider {
             val af2 = parseRinexDouble(l0, 61, 19)
 
             val l1 = record[1]
+            val aode = parseRinexDouble(l1, 4, 19).toInt()
             val crs = parseRinexDouble(l1, 23, 19)
             val deltaN = parseRinexDouble(l1, 42, 19)
             val m0 = parseRinexDouble(l1, 61, 19)
@@ -601,6 +602,7 @@ object BroadcastEphemerisProvider {
                         constellationType = Constellation.BEIDOU,
                         svid = svid,
                         week = week,
+                        iode = aode,
                         toe = toe, // keep in BDT
                         toc = toc,
                         af0 = af0,
