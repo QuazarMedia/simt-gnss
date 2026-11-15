@@ -78,10 +78,71 @@ class RtcmMsmParserTest {
         assertNotNull(sat5.carrierPhaseMeters)
         assertEquals(70.5 * rangeMs, sat5.carrierPhaseMeters!!, 1e-3)
         assertEquals(45.0, sat5.cnrDbHz, 1e-9)
+        assertEquals(144L, sat5.lockTimeMillis)
+        assertEquals(1234, sat5.referenceStationId)
 
         val sat12 = result.observations.first { it.svid == 12 }
         assertEquals(71.25 * rangeMs, sat12.pseudorangeMeters, 1e-3)
         assertEquals(40.0, sat12.cnrDbHz, 1e-9)
+        assertEquals(144L, sat12.lockTimeMillis)
+    }
+
+    @Test
+    fun parse_decodesMsm4LockTimeAndRejectsGlonassUnknownDf419() {
+        val msm4 = BitWriter()
+        msm4.u(1074, 12)
+        msm4.u(42, 12)
+        msm4.u(200_000, 30)
+        msm4.u(0, 1 + 3 + 7 + 2 + 2 + 1 + 3)
+        repeat(64) { i -> msm4.u(if (i == 0 || i == 1) 1 else 0, 1) } // sv 1 and 2
+        repeat(32) { i -> msm4.u(if (i == 1) 1 else 0, 1) } // signal 2
+        msm4.u(1, 1)
+        msm4.u(1, 1)
+        msm4.u(75, 8)
+        msm4.u(75, 8)
+        msm4.u(0, 10)
+        msm4.u(0, 10)
+        msm4.s(0, 15)
+        msm4.s(0, 15)
+        msm4.s(0, 22)
+        msm4.s(0, 22)
+        msm4.u(0, 4) // lock=0 -> 0 ms
+        msm4.u(11, 4) // lock=11 -> 32 << 10 = 32768 ms
+        msm4.u(0, 1)
+        msm4.u(0, 1)
+        msm4.u(42, 6)
+        msm4.u(42, 6)
+
+        val msm4Res = RtcmMsmParser.parse(msm4.toByteArray())
+        requireNotNull(msm4Res)
+        assertEquals(0L, msm4Res.observations.first { it.svid == 1 }.lockTimeMillis)
+        assertEquals(32_768L, msm4Res.observations.first { it.svid == 2 }.lockTimeMillis)
+        assertEquals(42, msm4Res.observations.first().referenceStationId)
+
+        // GLONASS MSM7 with DF419 = 15 (channel unknown/unavailable) -> carrierFrequencyHz must be 0.0
+        val glo = BitWriter()
+        glo.u(1087, 12)
+        glo.u(77, 12)
+        glo.u(10_000, 30)
+        glo.u(0, 1 + 3 + 7 + 2 + 2 + 1 + 3)
+        repeat(64) { i -> glo.u(if (i == 0) 1 else 0, 1) }
+        repeat(32) { i -> glo.u(if (i == 1) 1 else 0, 1) }
+        glo.u(1, 1)
+        glo.u(70, 8)
+        glo.u(15, 4) // DF419 = 15 -> unknown channel
+        glo.u(0, 10)
+        glo.s(0, 14)
+        glo.s(0, 20)
+        glo.s(0, 24)
+        glo.u(100, 10)
+        glo.u(0, 1)
+        glo.u(640, 10)
+        glo.s(0, 15)
+
+        val gloRes = RtcmMsmParser.parse(glo.toByteArray())
+        requireNotNull(gloRes)
+        assertEquals(1, gloRes.observations.size)
+        assertEquals(0.0, gloRes.observations.first().carrierFrequencyHz, 0.0)
     }
 
     @Test

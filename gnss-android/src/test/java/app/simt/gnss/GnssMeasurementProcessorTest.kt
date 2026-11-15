@@ -3,9 +3,13 @@ package app.simt.gnss
 import android.location.GnssNavigationMessage
 import android.location.GnssStatus
 import android.os.SystemClock
+import app.simt.gnss.core.correction.AtmosphericCorrection
+import app.simt.gnss.core.model.AdrState
+import app.simt.gnss.core.model.GnssSolutionMode
 import app.simt.gnss.core.model.SatelliteEphemeris
 import app.simt.gnss.core.model.SatelliteMeasurement
 import app.simt.gnss.core.orbit.SatellitePositionCalculator
+import app.simt.gnss.core.parser.RtcmMsmParser
 import app.simt.gnss.core.solver.GnssPositionSolver
 import app.simt.gnss.core.utils.GnssMathUtils
 import org.junit.Assert.*
@@ -13,6 +17,8 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import kotlin.math.abs
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 @RunWith(RobolectricTestRunner::class)
@@ -639,5 +645,377 @@ class GnssMeasurementProcessorTest {
         assertEquals(code.altitude, phase.altitude, 0.01)
         assertEquals(code.verticalAccuracyMeters, phase.verticalAccuracyMeters, 0.01f)
         assertEquals(code.horizontalAccuracyMeters, phase.horizontalAccuracyMeters, 0.01f)
+    }
+
+    private data class RtkFixture(
+        val processor: GnssMeasurementProcessor,
+        val roverMeasurements: List<SatelliteMeasurement>,
+        val roverLat: Double,
+        val roverLon: Double,
+        val roverAlt: Double,
+        val gpsTimeNanos: Long,
+    )
+
+    private fun buildRtkFixture(
+        baseLat: Double,
+        baseLon: Double,
+        baseAlt: Double,
+        roverLat: Double,
+        roverLon: Double,
+        roverAlt: Double,
+        constellationType: Int = GnssStatus.CONSTELLATION_GPS,
+        carrierFrequencyHz: Double = 1_575_420_000.0,
+        gpsTimeNanos: Long = syntheticGpsTimeNanos,
+        baseEpochOffsetSeconds: Double = 0.0,
+        includeTroposphere: Boolean = false,
+        includeIonosphere: Boolean = false,
+        includeCarrier: Boolean = true,
+        maxSatellites: Int = 24,
+    ): RtkFixture {
+        val rtkProcessor = GnssMeasurementProcessor()
+        val (baseX, baseY, baseZ) = GnssMathUtils.latLonAltToEcef(baseLat, baseLon, baseAlt)
+        val (roverX, roverY, roverZ) = GnssMathUtils.latLonAltToEcef(roverLat, roverLon, roverAlt)
+        val gpstSeconds = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
+        val constellationTimeSeconds =
+            if (constellationType == GnssStatus.CONSTELLATION_BEIDOU) {
+                (gpstSeconds - GnssMathUtils.BDT_GPST_OFFSET_SECONDS).mod(GnssMathUtils.SECONDS_IN_WEEK)
+            } else {
+                gpstSeconds
+            }
+        val baseTimeSeconds = (constellationTimeSeconds + baseEpochOffsetSeconds).mod(GnssMathUtils.SECONDS_IN_WEEK)
+        val dayOfYear =
+            run {
+                val unixSeconds = GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + (gpsTimeNanos / 1_000_000_000L)
+                val utcCalendar = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+                utcCalendar.timeInMillis = unixSeconds * 1000L
+                utcCalendar.get(java.util.Calendar.DAY_OF_YEAR)
+            }
+        val gpsTimeMs = gpsTimeNanos / 1_000_000L
+        val receipt = SystemClock.elapsedRealtime()
+        val ephemerides = ArrayList<SatelliteEphemeris>()
+        var svid = 1
+        for (raanDeg in 0 until 360 step 30) {
+            for (meanDeg in listOf(0.0, 90.0, 180.0, 270.0)) {
+                ephemerides +=
+                    SatelliteEphemeris(
+                        constellationType = constellationType,
+                        svid = svid,
+                        toe = constellationTimeSeconds,
+                        toc = constellationTimeSeconds,
+                        sqrtA = sqrt(26_560_000.0),
+                        eccentricity = 0.0,
+                        i0 = Math.toRadians(55.0),
+                        omega0 = Math.toRadians(raanDeg.toDouble()),
+                        omega = 0.0,
+                        m0 = Math.toRadians(meanDeg),
+                        lastUpdateTime = receipt,
+                    )
+                svid++
+            }
+        }
+        rtkProcessor.importExternalEphemeris(ephemerides, gpstSeconds)
+        rtkProcessor.rtkBaseStore.setBasePosition(baseX, baseY, baseZ, referenceStationId = 100)
+
+        val wavelength = GnssMathUtils.SPEED_OF_LIGHT / carrierFrequencyHz
+        val freqScale = (GnssMathUtils.L1_FREQUENCY_HZ / carrierFrequencyHz).pow(2)
+        val roverClockMeters = 25.0
+        val baseClockMeters = -11.0
+        val baseObservations = ArrayList<RtcmMsmParser.BaseObservation>()
+        val roverMeasurements = ArrayList<SatelliteMeasurement>()
+
+        for (eph in ephemerides) {
+            if (roverMeasurements.size >= maxSatellites) break
+            val roughRover = SatellitePositionCalculator.calculateSatellitePosition(eph, constellationTimeSeconds)
+            val flightRover =
+                sqrt(
+                    (roughRover.first - roverX).pow(2) +
+                        (roughRover.second - roverY).pow(2) +
+                        (roughRover.third - roverZ).pow(2),
+                ) / GnssMathUtils.SPEED_OF_LIGHT
+            val txRover = SatellitePositionCalculator.calculateSatellitePosition(eph, constellationTimeSeconds - flightRover)
+            val rotRover =
+                SatellitePositionCalculator.rotateEcefForEarthRotationDuringTransit(
+                    txRover.first,
+                    txRover.second,
+                    txRover.third,
+                    flightRover,
+                )
+            val (roverEl, roverAz) =
+                GnssMathUtils.ecefLosToElevationAzimuth(
+                    receiverX = roverX,
+                    receiverY = roverY,
+                    receiverZ = roverZ,
+                    receiverLatDeg = roverLat,
+                    receiverLonDeg = roverLon,
+                    satelliteX = rotRover.first,
+                    satelliteY = rotRover.second,
+                    satelliteZ = rotRover.third,
+                )
+
+            val roughBase = SatellitePositionCalculator.calculateSatellitePosition(eph, baseTimeSeconds)
+            val flightBase =
+                sqrt(
+                    (roughBase.first - baseX).pow(2) +
+                        (roughBase.second - baseY).pow(2) +
+                        (roughBase.third - baseZ).pow(2),
+                ) / GnssMathUtils.SPEED_OF_LIGHT
+            val txBase = SatellitePositionCalculator.calculateSatellitePosition(eph, baseTimeSeconds - flightBase)
+            val rotBase =
+                SatellitePositionCalculator.rotateEcefForEarthRotationDuringTransit(
+                    txBase.first,
+                    txBase.second,
+                    txBase.third,
+                    flightBase,
+                )
+            val (baseEl, baseAz) =
+                GnssMathUtils.ecefLosToElevationAzimuth(
+                    receiverX = baseX,
+                    receiverY = baseY,
+                    receiverZ = baseZ,
+                    receiverLatDeg = baseLat,
+                    receiverLonDeg = baseLon,
+                    satelliteX = rotBase.first,
+                    satelliteY = rotBase.second,
+                    satelliteZ = rotBase.third,
+                )
+            if (roverEl < 15.0 || baseEl < 15.0) continue
+
+            val roverGeomRange =
+                sqrt(
+                    (rotRover.first - roverX).pow(2) +
+                        (rotRover.second - roverY).pow(2) +
+                        (rotRover.third - roverZ).pow(2),
+                )
+            val baseGeomRange =
+                sqrt(
+                    (rotBase.first - baseX).pow(2) +
+                        (rotBase.second - baseY).pow(2) +
+                        (rotBase.third - baseZ).pow(2),
+                )
+            val roverTropo =
+                if (includeTroposphere) {
+                    AtmosphericCorrection.computeTroposphericDelay(roverEl, roverAlt, roverLat, dayOfYear)
+                } else {
+                    0.0
+                }
+            val baseTropo =
+                if (includeTroposphere) {
+                    AtmosphericCorrection.computeTroposphericDelay(baseEl, baseAlt, baseLat, dayOfYear)
+                } else {
+                    0.0
+                }
+            val roverIono =
+                if (includeIonosphere) {
+                    AtmosphericCorrection.computeIonosphericDelay(roverEl, roverAz, roverLat, roverLon, gpsTimeMs) * freqScale
+                } else {
+                    0.0
+                }
+            val baseIono =
+                if (includeIonosphere) {
+                    AtmosphericCorrection.computeIonosphericDelay(baseEl, baseAz, baseLat, baseLon, gpsTimeMs) * freqScale
+                } else {
+                    0.0
+                }
+
+            val roverN = (1000 + eph.svid * 7).toDouble()
+            val baseN = (1000 + eph.svid * 5).toDouble()
+            val roverPr = roverGeomRange + roverClockMeters + roverTropo + roverIono
+            val basePr = baseGeomRange + baseClockMeters + baseTropo + baseIono
+            val roverCp = if (includeCarrier) roverGeomRange + roverClockMeters + roverTropo - roverIono + roverN * wavelength else null
+            val baseCp = if (includeCarrier) baseGeomRange + baseClockMeters + baseTropo - baseIono + baseN * wavelength else null
+
+            baseObservations.add(
+                RtcmMsmParser.BaseObservation(
+                    constellationType = constellationType,
+                    svid = eph.svid,
+                    carrierFrequencyHz = carrierFrequencyHz,
+                    pseudorangeMeters = basePr,
+                    carrierPhaseMeters = baseCp,
+                    cnrDbHz = 45.0,
+                    epochTimeMs = (baseTimeSeconds * 1000.0).toLong(),
+                    signalId = 2,
+                    lockTimeMillis = 60_000L,
+                    referenceStationId = 100,
+                ),
+            )
+            roverMeasurements.add(
+                SatelliteMeasurement(
+                    constellationType = constellationType,
+                    svid = eph.svid,
+                    pseudorangeMeters = roverPr,
+                    carrierPhaseMeters = roverCp,
+                    wavelengthMeters = wavelength,
+                    carrierFrequencyHz = carrierFrequencyHz,
+                    cn0DbHz = 45.0,
+                    elevationDegrees = 20.0, // intentional placeholder before GnssStatus arrives
+                    azimuthDegrees = 0.0,
+                    accumulatedDeltaRangeMeters = roverCp,
+                    pseudorangeUncertaintyMeters = 0.5,
+                    isL5 = false,
+                    adrState = AdrState.VALID,
+                ),
+            )
+        }
+        assertTrue("need >= 4 matched satellites, had ${roverMeasurements.size}", roverMeasurements.size >= 4)
+        rtkProcessor.rtkBaseStore.putObservations(baseObservations)
+        return RtkFixture(rtkProcessor, roverMeasurements, roverLat, roverLon, roverAlt, gpsTimeNanos)
+    }
+
+    @Test
+    fun computeRtkPosition_rejectsBaselinesExceeding50Km() {
+        // 0.8 deg longitude at 47 deg lat ≈ 60.8 km (> 50 km cap).
+        val fixture =
+            buildRtkFixture(
+                baseLat = 47.0,
+                baseLon = 8.0,
+                baseAlt = 400.0,
+                roverLat = 47.0,
+                roverLon = 8.8,
+                roverAlt = 400.0,
+            )
+
+        // Seeded > 50 km -> immediately rejected.
+        assertNull(
+            fixture.processor.computeRtkPosition(
+                fixture.roverMeasurements,
+                fixture.gpsTimeNanos,
+                initialLat = fixture.roverLat,
+                initialLon = fixture.roverLon,
+                initialAlt = fixture.roverAlt,
+            ),
+        )
+        // Cold seed (0, 0) solves from baseEcef -> post-solve > 50 km -> still rejected!
+        assertNull(
+            fixture.processor.computeRtkPosition(
+                fixture.roverMeasurements,
+                fixture.gpsTimeNanos,
+            ),
+        )
+    }
+
+    @Test
+    fun computeRtkPosition_recoversAltitudeAcross500mVerticalBaselineWithTroposphericDelay() {
+        val fixture =
+            buildRtkFixture(
+                baseLat = 47.0,
+                baseLon = 8.0,
+                baseAlt = 100.0,
+                roverLat = 47.002,
+                roverLon = 8.002,
+                roverAlt = 600.0,
+                includeTroposphere = true,
+            )
+
+        // Cold seed (baseEcef): float refines altitude, re-evaluates rover tropo at 600 m, and fixes cm-accurate.
+        val result = fixture.processor.computeRtkPosition(fixture.roverMeasurements, fixture.gpsTimeNanos)
+        assertNotNull(result)
+        requireNotNull(result)
+        assertEquals(GnssSolutionMode.RTK_FIXED, result.solutionMode)
+        assertTrue(
+            "expected altitude within 5 cm of 600.0 m (tropo-corrected), was ${result.altitude} m",
+            abs(result.altitude - 600.0) < 0.05,
+        )
+    }
+
+    @Test
+    fun computeRtkPosition_appliesDifferentialIonosphereAbove10Km() {
+        // ~20 km baseline (> 10 km threshold, <= 50 km cap) with differential Klobuchar ionosphere.
+        val fixture =
+            buildRtkFixture(
+                baseLat = 47.0,
+                baseLon = 8.0,
+                baseAlt = 300.0,
+                roverLat = 47.15,
+                roverLon = 8.10,
+                roverAlt = 450.0,
+                includeTroposphere = true,
+                includeIonosphere = true,
+            )
+
+        val result =
+            fixture.processor.computeRtkPosition(
+                fixture.roverMeasurements,
+                fixture.gpsTimeNanos,
+                initialLat = fixture.roverLat,
+                initialLon = fixture.roverLon,
+                initialAlt = fixture.roverAlt,
+            )
+        assertNotNull(result)
+        requireNotNull(result)
+        assertEquals(GnssSolutionMode.RTK_FIXED, result.solutionMode)
+        assertTrue(
+            "expected altitude within 5 cm of 450.0 m on 20 km baseline, was ${result.altitude} m",
+            abs(result.altitude - 450.0) < 0.05,
+        )
+    }
+
+    @Test
+    fun computeRtkPosition_matchesBeidouObservationsAcrossGpsWeekBoundary() {
+        // gpstSeconds = 5.0 s -> BDT = (5.0 - 14.0) mod 604800 = 604,791.0 s.
+        // Base epoch is 1.0 s earlier (604,790.0 s BDT), and also test straddling 0.0 s BDT.
+        val fixture =
+            buildRtkFixture(
+                baseLat = 47.0,
+                baseLon = 8.0,
+                baseAlt = 400.0,
+                roverLat = 47.001,
+                roverLon = 8.001,
+                roverAlt = 420.0,
+                constellationType = GnssStatus.CONSTELLATION_BEIDOU,
+                carrierFrequencyHz = 1_561_098_000.0,
+                gpsTimeNanos = 5_000_000_000L,
+                baseEpochOffsetSeconds = -1.0,
+            )
+
+        val result = fixture.processor.computeRtkPosition(fixture.roverMeasurements, fixture.gpsTimeNanos)
+        assertNotNull("BeiDou observations across GPS week rollover must match", result)
+        requireNotNull(result)
+        assertEquals(GnssSolutionMode.RTK_FIXED, result.solutionMode)
+        assertTrue(abs(result.altitude - 420.0) < 0.05)
+
+        // Also test gpstSeconds = 15.0 s (BDT = 1.0 s) vs base at BDT = 604,799.0 s (-2.0 s across BDT week rollover).
+        val bdtRolloverFixture =
+            buildRtkFixture(
+                baseLat = 47.0,
+                baseLon = 8.0,
+                baseAlt = 400.0,
+                roverLat = 47.001,
+                roverLon = 8.001,
+                roverAlt = 420.0,
+                constellationType = GnssStatus.CONSTELLATION_BEIDOU,
+                carrierFrequencyHz = 1_561_098_000.0,
+                gpsTimeNanos = 15_000_000_000L,
+                baseEpochOffsetSeconds = -2.0,
+            )
+        val bdtRolloverResult =
+            bdtRolloverFixture.processor.computeRtkPosition(
+                bdtRolloverFixture.roverMeasurements,
+                bdtRolloverFixture.gpsTimeNanos,
+            )
+        assertNotNull("BeiDou observations across BDT week rollover must match", bdtRolloverResult)
+    }
+
+    @Test
+    fun computeRtkPosition_fourSatelliteCodeFloatDoesNotClaimTwoCmAccuracy() {
+        val fixture =
+            buildRtkFixture(
+                baseLat = 47.0,
+                baseLon = 8.0,
+                baseAlt = 400.0,
+                roverLat = 47.001,
+                roverLon = 8.001,
+                roverAlt = 405.0,
+                includeCarrier = false,
+                maxSatellites = 4,
+            )
+
+        val result = fixture.processor.computeRtkPosition(fixture.roverMeasurements, fixture.gpsTimeNanos)
+        assertNotNull(result)
+        requireNotNull(result)
+        assertEquals(GnssSolutionMode.RTK_FLOAT, result.solutionMode)
+        assertTrue(
+            "0-DOF 4-SV code float must not claim 2 cm accuracy, was ${result.horizontalAccuracyMeters} m",
+            result.horizontalAccuracyMeters > 0.2f,
+        )
     }
 }

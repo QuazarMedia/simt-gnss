@@ -157,7 +157,7 @@ class SimtGnssEngine(
                         ?.let { processor.rtkBaseStore.putObservations(it.observations) }
                 Rtcm1005Parser.isSupported(frame.messageType) ->
                     Rtcm1005Parser.parse(frame.payload)?.let {
-                        processor.rtkBaseStore.setBasePosition(it.xMeters, it.yMeters, it.zMeters)
+                        processor.rtkBaseStore.setBasePosition(it.xMeters, it.yMeters, it.zMeters, it.referenceStationId)
                     }
             }
         }

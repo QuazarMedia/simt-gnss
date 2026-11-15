@@ -46,6 +46,10 @@ object RtcmMsmParser {
         val epochTimeMs: Long,
         /** RTCM MSM signal id — identifies the tracked signal within the band (e.g. GPS 2 = 1C, 4 = 1W). */
         val signalId: Int = 0,
+        /** Decoded carrier-phase lock time (ms) from DF402 (MSM4/5) or DF407 (MSM6/7), or -1 if unavailable. */
+        val lockTimeMillis: Long = -1L,
+        /** Reference station id from the MSM header, or -1 when unspecified. */
+        val referenceStationId: Int = -1,
     )
 
     data class MsmObservations(
@@ -108,7 +112,7 @@ object RtcmMsmParser {
 
         val finePr = IntArray(nCell) { reader.s(if (highRes) 20 else 15).toInt() }
         val finePh = IntArray(nCell) { reader.s(if (highRes) 24 else 22).toInt() }
-        repeat(nCell) { reader.skip(if (highRes) 10 else 4) } // lock-time indicator (unused for now)
+        val lockTimeInd = IntArray(nCell) { reader.u(if (highRes) 10 else 4).toInt() }
         val halfCycle = IntArray(nCell) { reader.u(1).toInt() }
         val cnr = IntArray(nCell) { reader.u(if (highRes) 10 else 6).toInt() }
         if (withRates) repeat(nCell) { reader.skip(15) } // fine phase-range-rate (unused)
@@ -149,6 +153,8 @@ object RtcmMsmParser {
                     cnrDbHz = cnr[cell] * cnrScale,
                     epochTimeMs = epochTimeMs,
                     signalId = signalId,
+                    lockTimeMillis = decodeLockTimeMillis(lockTimeInd[cell], highRes),
+                    referenceStationId = referenceStationId,
                 ),
             )
         }
@@ -224,8 +230,8 @@ object RtcmMsmParser {
                     else -> 0.0
                 }
             Constellation.GLONASS -> {
-                if (!hasExtendedInfo) return 0.0
-                val channel = extendedInfo - 7 // DF419: channel + 7, range -7..+6
+                if (!hasExtendedInfo || extendedInfo > 13) return 0.0
+                val channel = extendedInfo - 7 // DF419: channel + 7, range -7..+6 (14..15 = unknown)
                 when (signalId) {
                     2, 3 -> 1_602_000_000.0 + channel * 562_500.0 // G1
                     8, 9 -> 1_246_000_000.0 + channel * 437_500.0 // G2
@@ -234,6 +240,25 @@ object RtcmMsmParser {
             }
             else -> 0.0
         }
+    }
+
+    /**
+     * Decodes RTCM 10403.3 phase-range lock-time indicator to minimum continuous lock duration (ms):
+     * DF402 (4-bit, MSM4/5 Table 3.5-74) or DF407 (10-bit, MSM6/7 Table 3.5-75).
+     */
+    private fun decodeLockTimeMillis(
+        indicator: Int,
+        highRes: Boolean,
+    ): Long {
+        if (indicator < 0) return -1L
+        if (!highRes) {
+            return if (indicator == 0) 0L else 32L shl (indicator - 1)
+        }
+        if (indicator <= 63) return indicator.toLong()
+        if (indicator > 704) return -1L // 705..1023 are reserved in RTCM 10403.3 Table 3.5-75
+        val band = (indicator - 64) / 32
+        val offset = (indicator - 64) % 32
+        return (64L shl band) + (offset.toLong() shl (band + 1))
     }
 
     /** Sequential MSB-first bit reader over an RTCM payload. */

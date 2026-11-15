@@ -27,6 +27,7 @@ import app.simt.gnss.core.parser.GalileoNavMessageParser
 import app.simt.gnss.core.parser.GlonassNavMessageParser
 import app.simt.gnss.core.parser.GpsCnavMt30Parser
 import app.simt.gnss.core.parser.GpsNavMessageParser
+import app.simt.gnss.core.parser.RtcmMsmParser
 import app.simt.gnss.core.parser.SbasNavMessageParser
 import app.simt.gnss.core.solver.DopplerVelocitySolver
 import app.simt.gnss.core.solver.GnssPositionSolver
@@ -2247,23 +2248,205 @@ internal class GnssMeasurementProcessor(
      * Returns null when there is no fresh base data, too few matched satellites, or the solve fails —
      * callers should then fall back to [computePosition].
      */
-    private fun rtkCarrierSamples(measurements: List<SatelliteMeasurement>): List<RtkAmbiguityMemory.Sample> {
-        val byKey = LinkedHashMap<Pair<Int, Int>, RtkAmbiguityMemory.Sample>()
-        for (meas in measurements) {
-            val key = meas.constellationType to meas.svid
-            if (byKey.containsKey(key) && meas.isL5) continue
-            byKey[key] =
-                RtkAmbiguityMemory.Sample(
+    private data class RtkMatchedObservation(
+        val meas: SatelliteMeasurement,
+        val baseObs: RtcmMsmParser.BaseObservation,
+        val satEcef: DoubleArray,
+        val baseSatEcef: DoubleArray,
+        val roverClockSeconds: Double,
+        val baseClockSeconds: Double,
+        val baseTropoMeters: Double,
+        val baseIonoL1Meters: Double,
+        val baseElevationDeg: Double,
+        val initialRoverElevationDeg: Double,
+        val initialRoverAzimuthDeg: Double,
+    )
+
+    private fun rtkCarrierSamples(matched: List<RtkMatchedObservation>): List<RtkAmbiguityMemory.Sample> =
+        matched.map { entry ->
+            val meas = entry.meas
+            RtkAmbiguityMemory.Sample(
+                constellationType = meas.constellationType,
+                svid = meas.svid,
+                adrMeters = meas.accumulatedDeltaRangeMeters,
+                adrState = meas.adrState,
+                rateMetersPerSecond = meas.pseudorangeRateMetersPerSecond,
+                rateUncertaintyMetersPerSecond = meas.pseudorangeRateUncertaintyMetersPerSecond,
+                halfCycleAmbiguous = isCarrierHalfCycleAmbiguous(meas.adrState),
+                bandMhz = (meas.carrierFrequencyHz / 1e6).roundToInt(),
+                baseLockTimeMillis = entry.baseObs.lockTimeMillis,
+            )
+        }
+
+    private fun ecefDistanceMeters(
+        a: DoubleArray,
+        b: DoubleArray,
+    ): Double {
+        val dx = a[0] - b[0]
+        val dy = a[1] - b[1]
+        val dz = a[2] - b[2]
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+
+    private fun buildRtkCodeInputs(
+        matched: List<RtkMatchedObservation>,
+        roverEcef: DoubleArray,
+        roverLat: Double,
+        roverLon: Double,
+        roverAlt: Double,
+        dayOfYear: Int,
+        gpsTimeMs: Long,
+        applyIono: Boolean,
+    ): List<RtkDoubleDifferenceSolver.SatelliteInput> =
+        matched.map { entry ->
+            val meas = entry.meas
+            val (roverEl, roverAz) =
+                GnssMathUtils.ecefLosToElevationAzimuth(
+                    receiverX = roverEcef[0],
+                    receiverY = roverEcef[1],
+                    receiverZ = roverEcef[2],
+                    receiverLatDeg = roverLat,
+                    receiverLonDeg = roverLon,
+                    satelliteX = entry.satEcef[0],
+                    satelliteY = entry.satEcef[1],
+                    satelliteZ = entry.satEcef[2],
+                )
+            val roverTropo = AtmosphericCorrection.computeTroposphericDelay(roverEl, roverAlt, roverLat, dayOfYear)
+            val freqScale =
+                if (meas.carrierFrequencyHz > 0.0) {
+                    (GnssMathUtils.L1_FREQUENCY_HZ / meas.carrierFrequencyHz).pow(2)
+                } else {
+                    1.0
+                }
+            val roverIono =
+                if (applyIono) {
+                    AtmosphericCorrection.computeIonosphericDelay(
+                        roverEl,
+                        roverAz,
+                        roverLat,
+                        roverLon,
+                        gpsTimeMs,
+                        ionoAlpha,
+                        ionoBeta,
+                    ) * freqScale
+                } else {
+                    0.0
+                }
+            val baseIono = if (applyIono) entry.baseIonoL1Meters * freqScale else 0.0
+            val codeSigma =
+                GnssMathUtils
+                    .pseudorangeSigmaFromElevationAndCn0(roverEl, meas.cn0DbHz)
+                    .coerceIn(GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS, GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS)
+            RtkDoubleDifferenceSolver.SatelliteInput(
+                satelliteEcef = entry.satEcef,
+                baseSatelliteEcef = entry.baseSatEcef,
+                roverObservationMeters =
+                    RtkDoubleDifferenceSolver.withoutSatelliteClock(
+                        meas.rawPseudorangeMeters,
+                        entry.roverClockSeconds,
+                    ) - roverTropo - roverIono,
+                baseObservationMeters =
+                    RtkDoubleDifferenceSolver.withoutSatelliteClock(
+                        entry.baseObs.pseudorangeMeters,
+                        entry.baseClockSeconds,
+                    ) - entry.baseTropoMeters - baseIono,
+                elevationDeg = roverEl,
+                sigmaMeters = codeSigma,
+                constellationType = meas.constellationType,
+                bandMhz = (meas.carrierFrequencyHz / 1e6).roundToInt(),
+            )
+        }
+
+    private fun buildRtkCarrierInputs(
+        matched: List<RtkMatchedObservation>,
+        roverEcef: DoubleArray,
+        roverLat: Double,
+        roverLon: Double,
+        roverAlt: Double,
+        dayOfYear: Int,
+        gpsTimeMs: Long,
+        applyIono: Boolean,
+    ): List<RtkDoubleDifferenceSolver.CarrierSatelliteInput> {
+        val inputs = ArrayList<RtkDoubleDifferenceSolver.CarrierSatelliteInput>(matched.size)
+        for (entry in matched) {
+            val meas = entry.meas
+            val roverCarrier = meas.carrierPhaseMeters ?: continue
+            val baseCarrier = entry.baseObs.carrierPhaseMeters ?: continue
+            if (meas.wavelengthMeters <= 0.0 || isCarrierHalfCycleAmbiguous(meas.adrState)) continue
+
+            val (roverEl, roverAz) =
+                GnssMathUtils.ecefLosToElevationAzimuth(
+                    receiverX = roverEcef[0],
+                    receiverY = roverEcef[1],
+                    receiverZ = roverEcef[2],
+                    receiverLatDeg = roverLat,
+                    receiverLonDeg = roverLon,
+                    satelliteX = entry.satEcef[0],
+                    satelliteY = entry.satEcef[1],
+                    satelliteZ = entry.satEcef[2],
+                )
+            val roverTropo = AtmosphericCorrection.computeTroposphericDelay(roverEl, roverAlt, roverLat, dayOfYear)
+            val freqScale =
+                if (meas.carrierFrequencyHz > 0.0) {
+                    (GnssMathUtils.L1_FREQUENCY_HZ / meas.carrierFrequencyHz).pow(2)
+                } else {
+                    1.0
+                }
+            val roverIono =
+                if (applyIono) {
+                    AtmosphericCorrection.computeIonosphericDelay(
+                        roverEl,
+                        roverAz,
+                        roverLat,
+                        roverLon,
+                        gpsTimeMs,
+                        ionoAlpha,
+                        ionoBeta,
+                    ) * freqScale
+                } else {
+                    0.0
+                }
+            val baseIono = if (applyIono) entry.baseIonoL1Meters * freqScale else 0.0
+            val codeSigma =
+                GnssMathUtils
+                    .pseudorangeSigmaFromElevationAndCn0(roverEl, meas.cn0DbHz)
+                    .coerceIn(GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS, GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS)
+            val sinEl = sin(Math.toRadians(roverEl)).coerceAtLeast(0.05)
+            val carrierSigma = (CARRIER_PHASE_BASE_SIGMA_METERS / sinEl).coerceIn(CARRIER_PHASE_BASE_SIGMA_METERS, 0.05)
+            inputs.add(
+                RtkDoubleDifferenceSolver.CarrierSatelliteInput(
+                    satelliteEcef = entry.satEcef,
+                    baseSatelliteEcef = entry.baseSatEcef,
+                    roverCodeMeters =
+                        RtkDoubleDifferenceSolver.withoutSatelliteClock(
+                            meas.rawPseudorangeMeters,
+                            entry.roverClockSeconds,
+                        ) - roverTropo - roverIono,
+                    baseCodeMeters =
+                        RtkDoubleDifferenceSolver.withoutSatelliteClock(
+                            entry.baseObs.pseudorangeMeters,
+                            entry.baseClockSeconds,
+                        ) - entry.baseTropoMeters - baseIono,
+                    roverCarrierMeters =
+                        RtkDoubleDifferenceSolver.withoutSatelliteClock(
+                            roverCarrier,
+                            entry.roverClockSeconds,
+                        ) - roverTropo + roverIono,
+                    baseCarrierMeters =
+                        RtkDoubleDifferenceSolver.withoutSatelliteClock(
+                            baseCarrier,
+                            entry.baseClockSeconds,
+                        ) - entry.baseTropoMeters + baseIono,
+                    wavelengthMeters = meas.wavelengthMeters,
+                    elevationDeg = roverEl,
+                    codeSigmaMeters = codeSigma,
+                    carrierSigmaMeters = carrierSigma,
                     constellationType = meas.constellationType,
                     svid = meas.svid,
-                    adrMeters = meas.accumulatedDeltaRangeMeters,
-                    adrState = meas.adrState,
-                    rateMetersPerSecond = meas.pseudorangeRateMetersPerSecond,
-                    rateUncertaintyMetersPerSecond = meas.pseudorangeRateUncertaintyMetersPerSecond,
-                    halfCycleAmbiguous = isCarrierHalfCycleAmbiguous(meas.adrState),
-                )
+                ),
+            )
         }
-        return byKey.values.toList()
+        return inputs
     }
 
     fun computeRtkPosition(
@@ -2278,12 +2461,40 @@ internal class GnssMeasurementProcessor(
             val basePosition = rtkBaseStore.getBasePosition() ?: return null
             val baseEcef = doubleArrayOf(basePosition.xMeters, basePosition.yMeters, basePosition.zMeters)
 
-            val gpstSeconds = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
-            val codeInputs = ArrayList<RtkDoubleDifferenceSolver.SatelliteInput>()
-            val carrierInputs = ArrayList<RtkDoubleDifferenceSolver.CarrierSatelliteInput>()
-            val usedSatKeys = HashSet<Pair<Int, Int>>()
+            val pppLast = pppState.getLastPositionEcef()
+            val hasSeed = pppLast != null || initialLat != 0.0 || initialLon != 0.0
+            val seedRover =
+                pppLast?.let { doubleArrayOf(it.first, it.second, it.third) }
+                    ?: if (initialLat != 0.0 || initialLon != 0.0) {
+                        val (sx, sy, sz) = GnssMathUtils.latLonAltToEcef(initialLat, initialLon, initialAlt)
+                        doubleArrayOf(sx, sy, sz)
+                    } else {
+                        baseEcef
+                    }
+            if (hasSeed && ecefDistanceMeters(baseEcef, seedRover) > GnssMathUtils.MAX_RTK_BASELINE_METERS) {
+                Log.d(TAG, "RTK: seed baseline exceeds ${GnssMathUtils.MAX_RTK_BASELINE_METERS}m — falling back to absolute")
+                return null
+            }
 
-            for (meas in measurements) {
+            val (baseLat, baseLon, baseAlt) = GnssMathUtils.ecefToLatLonAlt(baseEcef[0], baseEcef[1], baseEcef[2])
+            val (roverSeedLat, roverSeedLon, roverSeedAlt) =
+                GnssMathUtils.ecefToLatLonAlt(seedRover[0], seedRover[1], seedRover[2])
+            val gpsTimeMs = gpsTimeNanos / 1_000_000L
+            val dayOfYear: Int =
+                run {
+                    val unixSeconds = GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + (gpsTimeNanos / 1_000_000_000L)
+                    val utcCalendar = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+                    utcCalendar.timeInMillis = unixSeconds * 1000L
+                    utcCalendar.get(java.util.Calendar.DAY_OF_YEAR)
+                }
+
+            val gpstSeconds = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
+            val matched = ArrayList<RtkMatchedObservation>()
+            val usedSatKeys = HashSet<Pair<Int, Int>>()
+            val sortedMeasurements =
+                measurements.sortedWith(compareBy<SatelliteMeasurement>({ it.isL5 }, { -it.carrierFrequencyHz }))
+
+            for (meas in sortedMeasurements) {
                 val satKey = meas.constellationType to meas.svid
                 if (satKey in usedSatKeys) continue // one observation per satellite
                 val ephemeris = ephemerisMap[satKey]?.takeIf { isUsableEphemerisLocked(it, gpstSeconds) } ?: continue
@@ -2296,7 +2507,7 @@ internal class GnssMeasurementProcessor(
 
                 val currentTimeSeconds =
                     if (meas.constellationType == GnssStatus.CONSTELLATION_BEIDOU) {
-                        gpstSeconds - GnssMathUtils.BDT_GPST_OFFSET_SECONDS
+                        (gpstSeconds - GnssMathUtils.BDT_GPST_OFFSET_SECONDS).mod(GnssMathUtils.SECONDS_IN_WEEK)
                     } else {
                         gpstSeconds
                     }
@@ -2321,7 +2532,9 @@ internal class GnssMeasurementProcessor(
                 // double difference (kilometre-level residuals). The MSM epoch is already in the
                 // constellation's timescale (BDT for BeiDou, GPST otherwise), matching currentTimeSeconds.
                 val baseEpochSeconds = baseObs.epochTimeMs / 1000.0
-                if (kotlin.math.abs(baseEpochSeconds - currentTimeSeconds) > MAX_BASE_ROVER_EPOCH_DIFF_SECONDS) continue
+                if (abs(GnssMathUtils.wrapToHalfWeekSeconds(baseEpochSeconds - currentTimeSeconds)) > MAX_BASE_ROVER_EPOCH_DIFF_SECONDS) {
+                    continue
+                }
                 val baseTravel = rtkTransmitTiming(ephemeris, baseEpochSeconds, baseObs.pseudorangeMeters)
                 val (btx, bty, btz) =
                     SatellitePositionCalculator.calculateSatellitePosition(ephemeris, baseTravel.timing.transmitTimeSeconds)
@@ -2331,97 +2544,88 @@ internal class GnssMeasurementProcessor(
                         bty,
                         btz,
                         baseTravel.timing.rotationSeconds.coerceIn(MIN_TRAVEL_TIME_SECONDS, MAX_TRAVEL_TIME_SECONDS),
+                    ).let { doubleArrayOf(it.first, it.second, it.third) }
+
+                val (roverElevationDeg, roverAzimuthDeg) =
+                    GnssMathUtils.ecefLosToElevationAzimuth(
+                        receiverX = seedRover[0],
+                        receiverY = seedRover[1],
+                        receiverZ = seedRover[2],
+                        receiverLatDeg = roverSeedLat,
+                        receiverLonDeg = roverSeedLon,
+                        satelliteX = satEcef[0],
+                        satelliteY = satEcef[1],
+                        satelliteZ = satEcef[2],
                     )
-                        .let { doubleArrayOf(it.first, it.second, it.third) }
+                val (baseElevationDeg, baseAzimuthDeg) =
+                    GnssMathUtils.ecefLosToElevationAzimuth(
+                        receiverX = baseEcef[0],
+                        receiverY = baseEcef[1],
+                        receiverZ = baseEcef[2],
+                        receiverLatDeg = baseLat,
+                        receiverLonDeg = baseLon,
+                        satelliteX = baseSatEcef[0],
+                        satelliteY = baseSatEcef[1],
+                        satelliteZ = baseSatEcef[2],
+                    )
+                if (roverElevationDeg < RTK_MIN_ELEVATION_DEG || baseElevationDeg < RTK_MIN_ELEVATION_DEG) continue
 
-                val codeSigma =
-                    GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(meas.elevationDegrees, meas.cn0DbHz)
-                        .coerceIn(GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS, GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS)
+                val baseTropoMeters =
+                    AtmosphericCorrection.computeTroposphericDelay(baseElevationDeg, baseAlt, baseLat, dayOfYear)
+                val baseIonoL1Meters =
+                    AtmosphericCorrection.computeIonosphericDelay(
+                        baseElevationDeg,
+                        baseAzimuthDeg,
+                        baseLat,
+                        baseLon,
+                        gpsTimeMs,
+                        ionoAlpha,
+                        ionoBeta,
+                    )
 
-                codeInputs.add(
-                    RtkDoubleDifferenceSolver.SatelliteInput(
-                        satelliteEcef = satEcef,
-                        baseSatelliteEcef = baseSatEcef,
-                        roverObservationMeters =
-                            RtkDoubleDifferenceSolver.withoutSatelliteClock(
-                                meas.rawPseudorangeMeters,
-                                roverTiming.satelliteClockSeconds,
-                            ),
-                        baseObservationMeters =
-                            RtkDoubleDifferenceSolver.withoutSatelliteClock(
-                                baseObs.pseudorangeMeters,
-                                baseTravel.satelliteClockSeconds,
-                            ),
-                        elevationDeg = meas.elevationDegrees,
-                        sigmaMeters = codeSigma,
-                        constellationType = meas.constellationType,
-                        bandMhz = (meas.carrierFrequencyHz / 1e6).toInt(),
+                matched.add(
+                    RtkMatchedObservation(
+                        meas = meas,
+                        baseObs = baseObs,
+                        satEcef = satEcef,
+                        baseSatEcef = baseSatEcef,
+                        roverClockSeconds = roverTiming.satelliteClockSeconds,
+                        baseClockSeconds = baseTravel.satelliteClockSeconds,
+                        baseTropoMeters = baseTropoMeters,
+                        baseIonoL1Meters = baseIonoL1Meters,
+                        baseElevationDeg = baseElevationDeg,
+                        initialRoverElevationDeg = roverElevationDeg,
+                        initialRoverAzimuthDeg = roverAzimuthDeg,
                     ),
                 )
-
-                // Carrier double-difference input — only when both rover and base have valid
-                // phase AND the half-cycle ambiguity is not flagged unresolved: a Costas-loop
-                // phase that is still half-cycle ambiguous is offset by λ/2, which makes the DD
-                // ambiguity half-integer — integer fixing on it is wrong by ~10 cm per SV.
-                val roverCarrier = meas.carrierPhaseMeters
-                val baseCarrier = baseObs.carrierPhaseMeters
-                if (roverCarrier != null && baseCarrier != null && meas.wavelengthMeters > 0.0 &&
-                    !isCarrierHalfCycleAmbiguous(meas.adrState)
-                ) {
-                    val sinEl = sin(Math.toRadians(meas.elevationDegrees)).coerceAtLeast(0.05)
-                    val carrierSigma = (CARRIER_PHASE_BASE_SIGMA_METERS / sinEl).coerceIn(CARRIER_PHASE_BASE_SIGMA_METERS, 0.05)
-                    carrierInputs.add(
-                        RtkDoubleDifferenceSolver.CarrierSatelliteInput(
-                            satelliteEcef = satEcef,
-                            baseSatelliteEcef = baseSatEcef,
-                            roverCodeMeters =
-                                RtkDoubleDifferenceSolver.withoutSatelliteClock(
-                                    meas.rawPseudorangeMeters,
-                                    roverTiming.satelliteClockSeconds,
-                                ),
-                            baseCodeMeters =
-                                RtkDoubleDifferenceSolver.withoutSatelliteClock(
-                                    baseObs.pseudorangeMeters,
-                                    baseTravel.satelliteClockSeconds,
-                                ),
-                            roverCarrierMeters =
-                                RtkDoubleDifferenceSolver.withoutSatelliteClock(
-                                    roverCarrier,
-                                    roverTiming.satelliteClockSeconds,
-                                ),
-                            baseCarrierMeters =
-                                RtkDoubleDifferenceSolver.withoutSatelliteClock(
-                                    baseCarrier,
-                                    baseTravel.satelliteClockSeconds,
-                                ),
-                            wavelengthMeters = meas.wavelengthMeters,
-                            elevationDeg = meas.elevationDegrees,
-                            codeSigmaMeters = codeSigma,
-                            carrierSigmaMeters = carrierSigma,
-                            constellationType = meas.constellationType,
-                            svid = meas.svid,
-                        ),
-                    )
-                }
                 usedSatKeys.add(satKey)
             }
 
-            if (codeInputs.size < RtkDoubleDifferenceSolver.MIN_SATELLITES) {
-                Log.d(TAG, "RTK: only ${codeInputs.size} matched base+ephemeris satellites — cannot form double differences")
+            if (matched.size < RtkDoubleDifferenceSolver.MIN_SATELLITES) {
+                Log.d(TAG, "RTK: only ${matched.size} matched base+ephemeris satellites — cannot form double differences")
                 return null
             }
 
-            val seedRover =
-                pppState.getLastPositionEcef()?.let { doubleArrayOf(it.first, it.second, it.third) }
-                    ?: if (initialLat != 0.0 || initialLon != 0.0) {
-                        val (sx, sy, sz) = GnssMathUtils.latLonAltToEcef(initialLat, initialLon, initialAlt)
-                        doubleArrayOf(sx, sy, sz)
-                    } else {
-                        baseEcef
-                    }
+            val seedBaselineMeters = ecefDistanceMeters(baseEcef, seedRover)
+            val applyIonoInitial = hasSeed && seedBaselineMeters > RTK_IONO_BASELINE_THRESHOLD_METERS
+            var codeInputs =
+                buildRtkCodeInputs(
+                    matched = matched,
+                    roverEcef = seedRover,
+                    roverLat = roverSeedLat,
+                    roverLon = roverSeedLon,
+                    roverAlt = roverSeedAlt,
+                    dayOfYear = dayOfYear,
+                    gpsTimeMs = gpsTimeMs,
+                    applyIono = applyIonoInitial,
+                )
 
             // Always compute the robust code double-difference float solution (decimeter-class).
-            val floatSolution = RtkDoubleDifferenceSolver.solve(baseEcef, codeInputs, seedRover) ?: return null
+            var floatSolution = RtkDoubleDifferenceSolver.solve(baseEcef, codeInputs, seedRover) ?: return null
+            if (ecefDistanceMeters(baseEcef, floatSolution.roverEcef) > GnssMathUtils.MAX_RTK_BASELINE_METERS) {
+                Log.d(TAG, "RTK: solved baseline exceeds ${GnssMathUtils.MAX_RTK_BASELINE_METERS}m — falling back to absolute")
+                return null
+            }
 
             // Sanity guard: a healthy code DD has sub-metre-to-few-metre residuals. If the post-fit
             // rms is implausibly large after outlier rejection — e.g. a bad reference satellite that
@@ -2433,11 +2637,74 @@ internal class GnssMeasurementProcessor(
                 return null
             }
 
+            var (floatLat, floatLon, floatAlt) =
+                GnssMathUtils.ecefToLatLonAlt(
+                    floatSolution.roverEcef[0],
+                    floatSolution.roverEcef[1],
+                    floatSolution.roverEcef[2],
+                )
+            var floatBaselineMeters = ecefDistanceMeters(baseEcef, floatSolution.roverEcef)
+            var applyIonoRefined = floatBaselineMeters > RTK_IONO_BASELINE_THRESHOLD_METERS
+            if (abs(floatAlt - roverSeedAlt) > 5.0 || applyIonoRefined != applyIonoInitial) {
+                codeInputs =
+                    buildRtkCodeInputs(
+                        matched = matched,
+                        roverEcef = floatSolution.roverEcef,
+                        roverLat = floatLat,
+                        roverLon = floatLon,
+                        roverAlt = floatAlt,
+                        dayOfYear = dayOfYear,
+                        gpsTimeMs = gpsTimeMs,
+                        applyIono = applyIonoRefined,
+                    )
+                floatSolution = RtkDoubleDifferenceSolver.solve(baseEcef, codeInputs, floatSolution.roverEcef) ?: return null
+                if (ecefDistanceMeters(baseEcef, floatSolution.roverEcef) > GnssMathUtils.MAX_RTK_BASELINE_METERS) {
+                    Log.d(TAG, "RTK: refined baseline exceeds ${GnssMathUtils.MAX_RTK_BASELINE_METERS}m — falling back to absolute")
+                    return null
+                }
+                if (floatSolution.residualRms > RTK_MAX_ACCEPTABLE_FLOAT_RMS_METERS) {
+                    Log.d(TAG, "RTK float rms=${"%.1f".format(floatSolution.residualRms)}m exceeds sanity limit — falling back to absolute")
+                    return null
+                }
+                val refinedLla =
+                    GnssMathUtils.ecefToLatLonAlt(
+                        floatSolution.roverEcef[0],
+                        floatSolution.roverEcef[1],
+                        floatSolution.roverEcef[2],
+                    )
+                floatLat = refinedLla.first
+                floatLon = refinedLla.second
+                floatAlt = refinedLla.third
+                floatBaselineMeters = ecefDistanceMeters(baseEcef, floatSolution.roverEcef)
+                applyIonoRefined = floatBaselineMeters > RTK_IONO_BASELINE_THRESHOLD_METERS
+            }
+
+            val carrierInputs =
+                buildRtkCarrierInputs(
+                    matched = matched,
+                    roverEcef = floatSolution.roverEcef,
+                    roverLat = floatLat,
+                    roverLon = floatLon,
+                    roverAlt = floatAlt,
+                    dayOfYear = dayOfYear,
+                    gpsTimeMs = gpsTimeMs,
+                    applyIono = applyIonoRefined,
+                )
+
             // Then attempt to upgrade to an integer-fixed (centimeter) solution. This is purely
             // additive: solveFixed returns null unless the LAMBDA ratio test passes AND the fixed
             // position agrees with the float, so a marginal or wrong fix can never replace the float.
-            val carrierSamples = rtkCarrierSamples(measurements)
-            val fixedSolution =
+            val carrierSamples = rtkCarrierSamples(matched)
+            val float3dSigmaMeters =
+                sqrt(
+                    (
+                        floatSolution.covariance[0][0] +
+                            floatSolution.covariance[1][1] +
+                            floatSolution.covariance[2][2]
+                    ).coerceAtLeast(0.0),
+                )
+            val maxFixFloatSep = max(1.5, 4.0 * float3dSigmaMeters)
+            val rawFixedSolution =
                 if (carrierInputs.size >= RtkDoubleDifferenceSolver.MIN_FIX_SATELLITES) {
                     var carried: List<RtkDoubleDifferenceSolver.AmbiguityState>? = null
                     val fixed =
@@ -2448,19 +2715,23 @@ internal class GnssMeasurementProcessor(
                             floatRoverEcef = floatSolution.roverEcef,
                             priors = rtkAmbiguityMemory.applicablePriors(carrierSamples, gpsTimeNanos),
                             onFloat = { carried = it },
+                            maxFixFloatSeparationMeters = maxFixFloatSep,
                         )
-                    if (carried != null) {
-                        rtkAmbiguityMemory.remember(carried, carrierSamples, gpsTimeNanos)
-                    }
+                    carried?.let { rtkAmbiguityMemory.remember(it, carrierSamples, gpsTimeNanos) }
                     fixed
                 } else {
                     null
+                }
+            val fixedSolution =
+                rawFixedSolution?.takeIf {
+                    ecefDistanceMeters(baseEcef, it.roverEcef) <= GnssMathUtils.MAX_RTK_BASELINE_METERS
                 }
 
             val roverEcef: DoubleArray
             val residualRms: Double
             val covariance: Array<DoubleArray>
             val usedCount: Int
+            val degreesOfFreedom: Int
             val refSigma: Double
             val mode: String
             if (fixedSolution != null) {
@@ -2468,6 +2739,7 @@ internal class GnssMeasurementProcessor(
                 residualRms = fixedSolution.residualRms
                 covariance = fixedSolution.covariance
                 usedCount = fixedSolution.usedSatelliteCount
+                degreesOfFreedom = fixedSolution.degreesOfFreedom
                 refSigma = carrierInputs.map { it.carrierSigmaMeters }.average().coerceAtLeast(0.001)
                 mode = "FIXED ratio=${"%.1f".format(fixedSolution.ratio)}"
             } else {
@@ -2475,6 +2747,7 @@ internal class GnssMeasurementProcessor(
                 residualRms = floatSolution.residualRms
                 covariance = floatSolution.covariance
                 usedCount = floatSolution.usedSatelliteCount
+                degreesOfFreedom = floatSolution.degreesOfFreedom
                 refSigma = codeInputs.map { it.sigmaMeters }.average().coerceAtLeast(0.1)
                 mode = "FLOAT"
             }
@@ -2482,7 +2755,16 @@ internal class GnssMeasurementProcessor(
             val (lat, lon, alt) = GnssMathUtils.ecefToLatLonAlt(roverEcef[0], roverEcef[1], roverEcef[2])
             pppState.updatePosition(roverEcef[0], roverEcef[1], roverEcef[2], gpsTimeNanos)
 
-            val accuracy = computeRtkAccuracy(covariance, lat, lon, refSigma, residualRms)
+            val accuracy =
+                computeRtkAccuracy(
+                    covariance = covariance,
+                    lat = lat,
+                    lon = lon,
+                    refSigmaMeters = refSigma,
+                    residualRms = residualRms,
+                    degreesOfFreedom = degreesOfFreedom,
+                    isFloatMode = fixedSolution == null,
+                )
             Log.d(
                 TAG,
                 "RTK $mode: sats=$usedCount hAcc=${"%.2f".format(accuracy.horizontalMeters)}m rms=${"%.2f".format(residualRms)}m ${rtkBaseStore.describe()}",
@@ -2532,6 +2814,8 @@ internal class GnssMeasurementProcessor(
         lon: Double,
         refSigmaMeters: Double,
         residualRms: Double,
+        degreesOfFreedom: Int = 1,
+        isFloatMode: Boolean = false,
     ): RtkAccuracy {
         val latRad = Math.toRadians(lat)
         val lonRad = Math.toRadians(lon)
@@ -2568,7 +2852,14 @@ internal class GnssMeasurementProcessor(
 
         // A-posteriori unit-weight sigma from the realized residuals (honest scale), floored so a
         // genuine carrier fix can still report a few cm but never an unrealistic sub-cm circle.
-        val sigma0 = residualRms.coerceAtLeast(RTK_ACCURACY_SIGMA0_FLOOR_METERS)
+        // A 0-DOF code float has identically zero residuals by algebra, so keep the a-priori
+        // code sigma rather than advertising 2 cm accuracy from 4 satellites.
+        val sigma0 =
+            if (isFloatMode && (degreesOfFreedom <= 0 || residualRms == 0.0)) {
+                refSigma
+            } else {
+                residualRms.coerceAtLeast(RTK_ACCURACY_SIGMA0_FLOOR_METERS)
+            }
 
         return RtkAccuracy(
             horizontalMeters =
@@ -2907,6 +3198,12 @@ internal class GnssMeasurementProcessor(
 
         /** Zenith one-sigma carrier-phase noise (m) for RTK; scaled by 1/sin(elevation) per satellite. */
         private const val CARRIER_PHASE_BASE_SIGMA_METERS = 0.003
+
+        /** Minimum geometric elevation angle (degrees) for both base and rover in RTK. */
+        private const val RTK_MIN_ELEVATION_DEG = 10.0
+
+        /** Baseline threshold (m) above which differential Klobuchar ionosphere is applied in RTK. */
+        private const val RTK_IONO_BASELINE_THRESHOLD_METERS = 10_000.0
 
         /** Max base/rover epoch offset (s) tolerated for a double difference; guards against stale base data. */
         private const val MAX_BASE_ROVER_EPOCH_DIFF_SECONDS = 30.0
