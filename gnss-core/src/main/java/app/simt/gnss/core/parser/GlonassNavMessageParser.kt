@@ -2,8 +2,10 @@ package app.simt.gnss.core.parser
 import app.simt.gnss.core.model.Constellation
 import app.simt.gnss.core.model.SatelliteEphemeris
 import app.simt.gnss.core.platform.GnssPlatform
+import app.simt.gnss.core.utils.GnssMathUtils
 import app.simt.gnss.core.utils.GnssMathUtils.getBits
 import app.simt.gnss.core.utils.GnssMathUtils.getSignMagnitude
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.pow
 
@@ -19,6 +21,7 @@ import kotlin.math.pow
  */
 object GlonassNavMessageParser {
     private const val TAG = "GlonassNavParser"
+    private const val MAX_TK_TB_DIFF_SECONDS = 1800.0
 
     /**
      * Parse immediate ephemeris from GLONASS strings 1-4.
@@ -75,6 +78,7 @@ object GlonassNavMessageParser {
             // Bits 6-16: γn(tb) frequency offset (11 bits sign-mag, ×2^-40), ICD bits 79-69
             val gammaN = getSignMagnitude(str3, 6, 11) * 2.0.pow(-40)
             // Bit 17: spare, ICD bit 68; Bits 18-19: p (2 bits), ICD bits 67-66; Bit 20: ln health, ICD bit 65
+            val ln = getBits(str3, 20, 1)
             // Bits 21-44: zn'(tb) velocity Z (24 bits sign-mag), ICD bits 64-41
             val znDot = getSignMagnitude(str3, 21, 24) * 2.0.pow(-20) * 1e3
             // Bits 45-49: zn''(tb) acceleration Z (5 bits sign-mag), ICD bits 40-36
@@ -90,14 +94,27 @@ object GlonassNavMessageParser {
 
             // Sanity: position should be reasonable for GLONASS orbit (~25,510 km from center)
             val rKm = Math.sqrt(xn * xn + yn * yn + zn * zn) / 1e3
-            GnssPlatform.logger.d(TAG, "svid=$svid rKm=${"%.0f".format(rKm)} tb=$tb bn=$bn")
+            GnssPlatform.logger.d(TAG, "svid=$svid rKm=${"%.0f".format(rKm)} tb=$tb bn=$bn ln=$ln")
             if (rKm < 20000 || rKm > 30000) {
                 GnssPlatform.logger.w(TAG, "svid=$svid radius ${"%.0f".format(rKm)}km out of range — rejecting")
                 return null
             }
 
-            // Health check: Bn bit 2 set means malfunction
-            if ((bn and 0x4) != 0) return null
+            // Health check: Bn bit 2 set (ICD 5.1 §4.4) or String 3 ln != 0 (ICD 5.1 §4.5) means malfunction
+            if ((bn and 0x4) != 0 || ln != 0) return null
+
+            // String 1 / String 2 frame coherence: tk (Moscow TOD) and tb (15-min Moscow index)
+            // must belong to the same immediate ephemeris issue (|tk - tb| <= 30 min, wrapped mod 24 h).
+            if (tkH > 23 || tkM > 59 || tb > 95) return null
+            val tkSeconds = tkH * 3600.0 + tkM * 60.0 + tkS
+            val tbMoscowSeconds = tb * 900.0
+            var tkMinusTb = (tkSeconds - tbMoscowSeconds) % GnssMathUtils.SECONDS_IN_DAY
+            if (tkMinusTb > GnssMathUtils.SECONDS_IN_DAY / 2.0) tkMinusTb -= GnssMathUtils.SECONDS_IN_DAY
+            if (tkMinusTb < -GnssMathUtils.SECONDS_IN_DAY / 2.0) tkMinusTb += GnssMathUtils.SECONDS_IN_DAY
+            if (abs(tkMinusTb) > MAX_TK_TB_DIFF_SECONDS) {
+                GnssPlatform.logger.w(TAG, "svid=$svid tk=$tkSeconds inconsistent with tb=$tbMoscowSeconds — rejecting")
+                return null
+            }
 
             // Convert tb to GPS Time of Week
             val tbGpsTow = convertTbToGpsTow(tb, gpsTimeOfWeekSeconds, leapSeconds)

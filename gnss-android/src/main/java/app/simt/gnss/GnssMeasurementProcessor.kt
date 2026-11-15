@@ -28,6 +28,7 @@ import app.simt.gnss.core.parser.GlonassNavMessageParser
 import app.simt.gnss.core.parser.GpsCnavMt30Parser
 import app.simt.gnss.core.parser.GpsNavMessageParser
 import app.simt.gnss.core.parser.SbasNavMessageParser
+import app.simt.gnss.core.platform.GnssPlatform
 import app.simt.gnss.core.solver.DopplerVelocitySolver
 import app.simt.gnss.core.solver.GnssPositionSolver
 import app.simt.gnss.core.solver.GnssPositionSolver.Accuracy
@@ -89,7 +90,7 @@ internal class GnssMeasurementProcessor(
     private val gpsCnavIscMap = mutableMapOf<Pair<Int, Int>, GpsCnavIscRecord>()
     private val subframeStorage = mutableMapOf<Pair<Int, Int>, Array<ByteArray?>>()
     private val galileoWordStorage = mutableMapOf<Pair<Int, Int>, MutableMap<Int, ByteArray>>()
-    private val glonassStringStorage = mutableMapOf<Pair<Int, Int>, MutableMap<Int, ByteArray>>()
+    private val glonassStringStorage = mutableMapOf<Pair<Int, Int>, MutableMap<Int, Pair<ByteArray, Long>>>()
 
     /** SBAS PRN mask (MT 1) with its IODP, keyed by SBAS PRN. */
     private val sbasPrnMasks = mutableMapOf<Int, SbasNavMessageParser.SbasPrnMask>()
@@ -105,9 +106,20 @@ internal class GnssMeasurementProcessor(
 
     /** GPS TOW (seconds) when the last GLONASS nav message was received, for tb conversion. */
     private var lastGpsTimeOfWeekSeconds: Double = 0.0
+    private var hasGpsTimeOfWeek: Boolean = false
 
     /** GPS−UTC leap seconds from the receiver clock (fallback: compile-time constant). */
     private var lastKnownLeapSeconds: Int = GnssMathUtils.GPS_UTC_LEAP_SECONDS.toInt()
+
+    internal fun currentSystemGpsTimeNanos(leapSeconds: Int = lastKnownLeapSeconds): Long = ((System.currentTimeMillis() / 1000L - GnssMathUtils.GPS_EPOCH_UNIX_SECONDS) + leapSeconds) * GnssMathUtils.NANOS_PER_SECOND
+
+    internal fun getStoredEphemerisForTest(
+        constellationType: Int,
+        svid: Int,
+    ): SatelliteEphemeris? = synchronized(lock) { ephemerisMap[constellationType to svid] }
+
+    internal fun getLastKnownLeapSecondsForTest(): Int = synchronized(lock) { lastKnownLeapSeconds }
+
     private val gpsLastBits = mutableMapOf<Pair<Int, Int>, Int>()
     private var ionoAlpha: DoubleArray? = null
     private var ionoBeta: DoubleArray? = null
@@ -331,16 +343,32 @@ internal class GnssMeasurementProcessor(
                         val dataStringNumber = GnssMathUtils.getBits(data, 1, 4)
                         val effectiveStringNumber = if (stringNumber in 1..15) stringNumber else dataStringNumber
                         Log.d(TAG, "GLO L1OF svid=$svid string=$effectiveStringNumber dataSize=${data.size} stringsCollected=${glonassStringStorage[satKey]?.size ?: 0}")
-                        if (effectiveStringNumber in 1..4) {
+                        if (effectiveStringNumber in 1..4 && data.size >= 11) {
+                            val nowMs = GnssPlatform.timeSource.elapsedRealtimeMs()
                             val strings = glonassStringStorage.getOrPut(satKey) { mutableMapOf() }
-                            strings[effectiveStringNumber] = data
+                            // Evict strings older than 30 s: strings 1–4 broadcast within 8 s of one
+                            // 30 s frame, so older fragments may belong to a different tb boundary.
+                            strings.entries.removeAll { (_, entry) -> nowMs - entry.second > GLONASS_STRING_MAX_AGE_MS }
+                            if (effectiveStringNumber == 2) {
+                                val newTb = GnssMathUtils.getBits(data, 9, 7)
+                                val previousString2 = strings[2]?.first
+                                if (previousString2 != null && GnssMathUtils.getBits(previousString2, 9, 7) != newTb) {
+                                    strings.keys.removeAll { it != 2 }
+                                }
+                            }
+                            strings[effectiveStringNumber] = data to nowMs
 
                             if (strings.size >= 4) {
-                                val gpsTow = lastGpsTimeOfWeekSeconds
+                                val gpsTow =
+                                    if (hasGpsTimeOfWeek) {
+                                        lastGpsTimeOfWeekSeconds
+                                    } else {
+                                        (currentSystemGpsTimeNanos(lastKnownLeapSeconds) / 1e9).mod(GnssMathUtils.SECONDS_IN_WEEK)
+                                    }
                                 val ephemeris =
                                     GlonassNavMessageParser.parseGlonassEphemeris(
                                         svid = svid,
-                                        strings = strings,
+                                        strings = strings.mapValues { (_, entry) -> entry.first },
                                         gpsTimeOfWeekSeconds = gpsTow,
                                         leapSeconds = lastKnownLeapSeconds,
                                     )
@@ -434,11 +462,13 @@ internal class GnssMeasurementProcessor(
         )
     }
 
-    /** TOW the ephemeris data is referenced to (orbit epoch), for recency comparisons. */
+    /** TOW the ephemeris data is referenced to (orbit epoch, in GPST), for recency comparisons. */
     private fun ephemerisReferenceTow(ephemeris: SatelliteEphemeris): Double =
         when {
             ephemeris.isGlonass -> ephemeris.gloTbGpsTow
             ephemeris.isSbas -> ephemeris.sbasT0 // seconds of day; only compared SBAS-vs-SBAS
+            ephemeris.constellationType == GnssStatus.CONSTELLATION_BEIDOU ->
+                (ephemeris.toe + GnssMathUtils.BDT_GPST_OFFSET_SECONDS).mod(GnssMathUtils.SECONDS_IN_WEEK)
             else -> ephemeris.toe
         }
 
@@ -1099,27 +1129,25 @@ internal class GnssMeasurementProcessor(
             hatchFilter.beginNewMeasurementsEpoch()
             dopplerSmoother.beginNewMeasurementsEpoch()
 
+            // GPS−UTC leap seconds: prefer the receiver-reported value (survives future leap
+            // events); retain the last reported value across epochs where hasLeapSecond() is false.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && clock.hasLeapSecond() && clock.leapSecond > 0) {
+                lastKnownLeapSeconds = clock.leapSecond
+            }
+            val epochLeapSeconds = lastKnownLeapSeconds.toDouble()
+
             // Compute GPS time from GnssClock fields (nanoseconds since GPS epoch)
             val gpsTimeNanos =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && clock.hasFullBiasNanos()) {
                     clock.timeNanos - clock.fullBiasNanos - (if (clock.hasBiasNanos()) clock.biasNanos.toLong() else 0L)
                 } else {
-                    // Fallback: approximate from system clock (UTC + ~18 leap seconds)
-                    (System.currentTimeMillis() / 1000L + GnssMathUtils.GPS_UTC_LEAP_SECONDS) * GnssMathUtils.NANOS_PER_SECOND
+                    // Fallback: approximate from system clock (UTC − GPS epoch + leap seconds)
+                    currentSystemGpsTimeNanos(lastKnownLeapSeconds)
                 }
 
             // Cache GPS TOW for GLONASS tb conversion in processNavigationMessage
-            lastGpsTimeOfWeekSeconds = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
-
-            // GPS−UTC leap seconds: prefer the receiver-reported value (survives future leap
-            // events); fall back to the compile-time constant.
-            val epochLeapSeconds =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && clock.hasLeapSecond()) {
-                    clock.leapSecond.toDouble()
-                } else {
-                    GnssMathUtils.GPS_UTC_LEAP_SECONDS.toDouble()
-                }
-            lastKnownLeapSeconds = epochLeapSeconds.toInt()
+            lastGpsTimeOfWeekSeconds = (gpsTimeNanos / 1e9).mod(GnssMathUtils.SECONDS_IN_WEEK)
+            hasGpsTimeOfWeek = true
 
             val satelliteInfo = mutableMapOf<Pair<Int, Int>, Pair<Double, Double>>()
             gnssStatus?.let { status ->
@@ -1330,12 +1358,22 @@ internal class GnssMeasurementProcessor(
         receivedSvTimeNanos: Long,
         leapSeconds: Double,
     ): Double? {
-        val isGlonass = constellationType == GnssStatus.CONSTELLATION_GLONASS
+        if ((measurementState and GnssMeasurement.STATE_MSEC_AMBIGUOUS) != 0) return null
 
-        val towDecoded = (measurementState and GnssMeasurement.STATE_TOW_DECODED) != 0
-        val towKnown =
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
-                (measurementState and GnssMeasurement.STATE_TOW_KNOWN) != 0
+        val isGlonass = constellationType == GnssStatus.CONSTELLATION_GLONASS
+        val hasCodeLock =
+            (
+                measurementState and
+                    (
+                        GnssMeasurement.STATE_CODE_LOCK or
+                            GnssMeasurement.STATE_2ND_CODE_LOCK or
+                            GnssMeasurement.STATE_GAL_E1BC_CODE_LOCK or
+                            GnssMeasurement.STATE_GAL_E1C_2ND_CODE_LOCK
+                    )
+            ) != 0
+
+        val towDecoded = !isGlonass && (measurementState and GnssMeasurement.STATE_TOW_DECODED) != 0
+        val towKnown = !isGlonass && (measurementState and GnssMeasurement.STATE_TOW_KNOWN) != 0 && hasCodeLock
         val gloTodDecoded =
             isGlonass &&
                 (
@@ -2893,6 +2931,7 @@ internal class GnssMeasurementProcessor(
         private const val TAG = "GnssMeasurementProcessor"
         private const val MAX_PSEUDORANGE_RATE_SIGMA_MPS = 5.0
         private const val DOPPLER_EFFECTIVE_MAX_SMOOTHING_EPOCHS = 9
+        private const val GLONASS_STRING_MAX_AGE_MS = 30_000L
 
         /**
          * When [android.location.GnssStatus] has not yet reported this SV, elevation defaults to 0° in the

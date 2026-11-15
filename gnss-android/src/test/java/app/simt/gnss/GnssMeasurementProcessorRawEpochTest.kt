@@ -1,13 +1,18 @@
 package app.simt.gnss
 
+import android.location.GnssClock
 import android.location.GnssMeasurement
+import android.location.GnssMeasurementsEvent
 import android.location.GnssStatus
+import app.simt.gnss.core.utils.GnssMathUtils
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import kotlin.math.abs
 
 /**
  * Tests of [GnssMeasurementProcessor.computeRawPseudorangeMeters] — pseudorange formation
@@ -151,5 +156,88 @@ class GnssMeasurementProcessorRawEpochTest {
         assertNotNull(pr)
         val expected = (travelNanos + fractionNanos) / 1e9 * speedOfLight
         assertEquals("pseudorange must be exact to the centimetre at full GPS time", expected, pr!!, 0.01)
+    }
+
+    @Test
+    fun pilotSignal_withTowKnownAnd2ndCodeLock_acceptedWithoutTowDecoded() {
+        val travelSeconds = 0.072
+        val txNanos = ((388_800.0 - travelSeconds) * 1e9).toLong()
+        val state = GnssMeasurement.STATE_TOW_KNOWN or GnssMeasurement.STATE_2ND_CODE_LOCK
+        val pr = pseudorange(GnssStatus.CONSTELLATION_GPS, state, txNanos)
+        assertNotNull("Pilot L5/E5a with STATE_TOW_KNOWN and 2ND_CODE_LOCK must survive on API 28", pr)
+        assertEquals(travelSeconds * speedOfLight, pr!!, 1.0)
+    }
+
+    @Test
+    fun towKnownWithoutCodeLock_isRejected() {
+        val travelSeconds = 0.072
+        val txNanos = ((388_800.0 - travelSeconds) * 1e9).toLong()
+        assertNull(
+            "STATE_TOW_KNOWN without any code-lock bit must be rejected",
+            pseudorange(GnssStatus.CONSTELLATION_GPS, GnssMeasurement.STATE_TOW_KNOWN, txNanos),
+        )
+    }
+
+    @Test
+    fun towDecodedWithMsecAmbiguous_isRejected() {
+        val travelSeconds = 0.072
+        val txNanos = ((388_800.0 - travelSeconds) * 1e9).toLong()
+        val state = GnssMeasurement.STATE_TOW_DECODED or GnssMeasurement.STATE_MSEC_AMBIGUOUS
+        assertNull(
+            "STATE_MSEC_AMBIGUOUS must always be rejected (300 km ambiguity)",
+            pseudorange(GnssStatus.CONSTELLATION_GPS, state, txNanos),
+        )
+    }
+
+    private fun buildGnssClock(leapSecond: Int? = null): GnssClock {
+        val ctor = GnssClock::class.java.getDeclaredConstructor()
+        ctor.isAccessible = true
+        val clock = ctor.newInstance()
+        if (leapSecond != null) {
+            GnssClock::class.java.getMethod("setLeapSecond", Int::class.javaPrimitiveType).invoke(clock, leapSecond)
+        }
+        return clock
+    }
+
+    @Test
+    fun fallbackGpsTimeNanos_subtractsGpsEpochAndRetainsReceiverLeapSeconds() {
+        val clockWithoutFullBias = buildGnssClock()
+        val eventWithoutFullBias =
+            GnssMeasurementsEvent.Builder()
+                .setClock(clockWithoutFullBias)
+                .setMeasurements(emptyList())
+                .build()
+
+        val beforeSec = System.currentTimeMillis() / 1000L
+        val processed = processor.processMeasurements(eventWithoutFullBias, null)
+        val afterSec = System.currentTimeMillis() / 1000L
+
+        val expectedMinNanos = (beforeSec - GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + 18L) * GnssMathUtils.NANOS_PER_SECOND
+        val expectedMaxNanos = (afterSec - GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + 18L) * GnssMathUtils.NANOS_PER_SECOND + 1_000_000_000L
+        assertTrue(
+            "Fallback gpsTimeNanos (${processed.gpsTimeNanos}) must subtract GPS_EPOCH_UNIX_SECONDS (expected [$expectedMinNanos, $expectedMaxNanos])",
+            processed.gpsTimeNanos in expectedMinNanos..expectedMaxNanos,
+        )
+
+        // Receiver reports leapSecond = 19, then a subsequent epoch omits hasLeapSecond():
+        // lastKnownLeapSeconds must stay 19 rather than reverting to 18.
+        val clockWithLeap = buildGnssClock(leapSecond = 19)
+        processor.processMeasurements(
+            GnssMeasurementsEvent.Builder()
+                .setClock(clockWithLeap)
+                .setMeasurements(emptyList())
+                .build(),
+            null,
+        )
+        assertEquals(19, processor.getLastKnownLeapSecondsForTest())
+
+        val before19Sec = System.currentTimeMillis() / 1000L
+        val processedAfterLeapOmitted = processor.processMeasurements(eventWithoutFullBias, null)
+        val expected19Nanos = (before19Sec - GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + 19L) * GnssMathUtils.NANOS_PER_SECOND
+        assertEquals(19, processor.getLastKnownLeapSecondsForTest())
+        assertTrue(
+            "Retained leapSecond=19 should be used in fallback gpsTimeNanos",
+            abs(processedAfterLeapOmitted.gpsTimeNanos - expected19Nanos) <= 2_000_000_000L,
+        )
     }
 }

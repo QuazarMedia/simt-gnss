@@ -21,6 +21,11 @@ object BroadcastEphemerisProvider {
     /** Retain ephemeris within this many seconds for offline propagation (24 hours). */
     private const val MAX_EPHEMERIS_AGE_SECONDS = 86400.0 // 24 hours
 
+    private data class ParsedRecord(
+        val ephemeris: SatelliteEphemeris,
+        val fullGpsSeconds: Double?,
+    )
+
     /**
      * Galileo SV health is a bit field (RINEX 3.04 Table A8): E1-B bits 0–2, E5a bits 3–5,
      * E5b bits 6–8. An I/NAV record (data-source bits 0, 2 or 9) is rejected when E1-B is
@@ -59,36 +64,62 @@ object BroadcastEphemerisProvider {
      * allocates a second list holding every line. The streaming overloads keep only the
      * current record in memory.
      */
+    @JvmOverloads
     fun parseRinex3MixedNav(
         content: String,
         gpsTimeOfWeekSeconds: Double,
-    ): List<SatelliteEphemeris> = parseRinex3MixedNav(content.lineSequence(), gpsTimeOfWeekSeconds)
+        currentGpsSecondsSinceEpoch: Double? = null,
+        leapSeconds: Int = GnssMathUtils.GPS_UTC_LEAP_SECONDS.toInt(),
+    ): List<SatelliteEphemeris> =
+        parseRinex3MixedNav(
+            content.lineSequence(),
+            gpsTimeOfWeekSeconds,
+            currentGpsSecondsSinceEpoch,
+            leapSeconds,
+        )
 
     /**
      * Parses a RINEX 3 mixed navigation stream line by line. The reader is consumed lazily and
      * is not closed by this function — the caller owns it.
      */
+    @JvmOverloads
     fun parseRinex3MixedNav(
         reader: BufferedReader,
         gpsTimeOfWeekSeconds: Double,
-    ): List<SatelliteEphemeris> = parseRinex3MixedNav(reader.lineSequence(), gpsTimeOfWeekSeconds)
+        currentGpsSecondsSinceEpoch: Double? = null,
+        leapSeconds: Int = GnssMathUtils.GPS_UTC_LEAP_SECONDS.toInt(),
+    ): List<SatelliteEphemeris> =
+        parseRinex3MixedNav(
+            reader.lineSequence(),
+            gpsTimeOfWeekSeconds,
+            currentGpsSecondsSinceEpoch,
+            leapSeconds,
+        )
 
     /**
      * Parses RINEX 3 mixed navigation file lines and returns ephemeris records.
-     * Handles GPS (G), GLONASS (R), Galileo (E), and BeiDou (C) satellite systems.
+     * Handles GPS (G), QZSS (J), GLONASS (R), Galileo (E), and BeiDou (C) satellite systems.
      *
      * Lines are consumed lazily; at most one record (8 lines for the Keplerian systems, 4 for
      * GLONASS) is held at a time.
      *
      * @param lines Raw RINEX 3 mixed navigation file lines
-     * @param gpsTimeOfWeekSeconds Current GPS time of week in seconds (for age filtering)
+     * @param gpsTimeOfWeekSeconds Current GPS time of week in seconds (for age filtering when
+     *   [currentGpsSecondsSinceEpoch] is null)
+     * @param currentGpsSecondsSinceEpoch Optional full GPST seconds since GPS epoch (1980-01-06
+     *   00:00:00 GPST). When supplied, age is computed against each record's full calendar epoch
+     *   so multi-week-old files cannot wrap modulo 604,800 s to zero age.
+     * @param leapSeconds Current GPS−UTC leap-second offset (used to map GLONASS UTC epochs to GPST)
      * @return Deduplicated, age-filtered list of ephemeris records
      */
+    @JvmOverloads
     fun parseRinex3MixedNav(
         lines: Sequence<String>,
         gpsTimeOfWeekSeconds: Double,
+        currentGpsSecondsSinceEpoch: Double? = null,
+        leapSeconds: Int = GnssMathUtils.GPS_UTC_LEAP_SECONDS.toInt(),
     ): List<SatelliteEphemeris> {
-        val results = mutableListOf<SatelliteEphemeris>()
+        val results = mutableListOf<ParsedRecord>()
         val iterator = lines.iterator()
 
         // Skip header (ends with "END OF HEADER"). When it is absent the iterator is drained
@@ -110,28 +141,35 @@ object BroadcastEphemerisProvider {
                     totalRecords++
                     val eph =
                         readRecord(iterator, line, KEPLERIAN_RECORD_LINES)
-                            ?.let { parseGpsRecord(it, now, gpsTimeOfWeekSeconds) }
+                            ?.let { parseGpsRecord(it, now, Constellation.GPS) }
+                    if (eph != null) results.add(eph) else skippedRecords++
+                }
+                'J' -> {
+                    totalRecords++
+                    val eph =
+                        readRecord(iterator, line, KEPLERIAN_RECORD_LINES)
+                            ?.let { parseGpsRecord(it, now, Constellation.QZSS) }
                     if (eph != null) results.add(eph) else skippedRecords++
                 }
                 'E' -> {
                     totalRecords++
                     val eph =
                         readRecord(iterator, line, KEPLERIAN_RECORD_LINES)
-                            ?.let { parseGalileoRecord(it, now, gpsTimeOfWeekSeconds) }
+                            ?.let { parseGalileoRecord(it, now) }
                     if (eph != null) results.add(eph) else skippedRecords++
                 }
                 'R' -> {
                     totalRecords++
                     val eph =
                         readRecord(iterator, line, GLONASS_RECORD_LINES)
-                            ?.let { parseGlonassRecord(it, now, gpsTimeOfWeekSeconds) }
+                            ?.let { parseGlonassRecord(it, now, leapSeconds) }
                     if (eph != null) results.add(eph) else skippedRecords++
                 }
                 'C' -> {
                     totalRecords++
                     val eph =
                         readRecord(iterator, line, KEPLERIAN_RECORD_LINES)
-                            ?.let { parseBeidouRecord(it, now, gpsTimeOfWeekSeconds) }
+                            ?.let { parseBeidouRecord(it, now) }
                     if (eph != null) results.add(eph) else skippedRecords++
                 }
                 else -> Unit
@@ -142,11 +180,21 @@ object BroadcastEphemerisProvider {
 
         // Deduplicate: keep the record whose orbit reference time is closest to NOW.
         // (Sorting GLONASS by `toe` previously kept the file's OLDEST record — GLONASS
-        // records carry toe = 0 and are referenced by tb instead.)
-        fun referenceTow(eph: SatelliteEphemeris): Double = if (eph.isGlonass) eph.gloTbGpsTow else eph.toe
+        // records carry toe = 0 and are referenced by tb instead; BeiDou toe is BDT = GPST − 14 s.)
+        fun referenceTow(eph: SatelliteEphemeris): Double =
+            when {
+                eph.isGlonass -> eph.gloTbGpsTow
+                eph.constellationType == Constellation.BEIDOU ->
+                    (eph.toe + GnssMathUtils.BDT_GPST_OFFSET_SECONDS).mod(GnssMathUtils.SECONDS_IN_WEEK)
+                else -> eph.toe
+            }
 
-        fun ageSeconds(eph: SatelliteEphemeris): Double {
-            var dt = gpsTimeOfWeekSeconds - referenceTow(eph)
+        fun ageSeconds(rec: ParsedRecord): Double {
+            if (currentGpsSecondsSinceEpoch != null) {
+                val fullSec = rec.fullGpsSeconds ?: return Double.POSITIVE_INFINITY
+                return kotlin.math.abs(currentGpsSecondsSinceEpoch - fullSec)
+            }
+            var dt = gpsTimeOfWeekSeconds - referenceTow(rec.ephemeris)
             if (dt > 302400.0) dt -= 604800.0
             if (dt < -302400.0) dt += 604800.0
             return kotlin.math.abs(dt)
@@ -154,11 +202,13 @@ object BroadcastEphemerisProvider {
 
         val deduped =
             results
-                .groupBy { it.constellationType to it.svid }
-                .mapValues { (_, ephs) ->
-                    ephs.minWithOrNull(
-                        compareBy<SatelliteEphemeris>(::ageSeconds).thenBy { if (it.galileoInavClock) 1 else 0 },
-                    ) ?: ephs.first()
+                .groupBy { it.ephemeris.constellationType to it.ephemeris.svid }
+                .mapValues { (_, recs) ->
+                    recs.minWithOrNull(
+                        compareBy<ParsedRecord>(::ageSeconds)
+                            .thenByDescending { it.fullGpsSeconds ?: Double.NEGATIVE_INFINITY }
+                            .thenBy { if (it.ephemeris.galileoInavClock) 1 else 0 },
+                    ) ?: recs.first()
                 }
                 .values
                 .toList()
@@ -168,10 +218,17 @@ object BroadcastEphemerisProvider {
         // 30 min) — a Keplerian-style multi-hour window would feed the RK4 integrator
         // states it cannot extrapolate.
         val filtered =
-            deduped.filter { eph ->
-                val maxAge = if (eph.isGlonass) GnssMathUtils.GLONASS_MAX_PROPAGATION_SECONDS else MAX_EPHEMERIS_AGE_SECONDS
-                ageSeconds(eph) <= maxAge
-            }
+            deduped
+                .filter { rec ->
+                    val maxAge =
+                        if (rec.ephemeris.isGlonass) {
+                            GnssMathUtils.GLONASS_MAX_PROPAGATION_SECONDS
+                        } else {
+                            MAX_EPHEMERIS_AGE_SECONDS
+                        }
+                    ageSeconds(rec) <= maxAge
+                }
+                .map { it.ephemeris }
         GnssPlatform.logger.d(TAG, "Age filter: ${deduped.size} deduped → ${filtered.size} within validity of current time")
         return filtered
     }
@@ -195,15 +252,48 @@ object BroadcastEphemerisProvider {
         return record
     }
 
+    /**
+     * Parses RINEX 3 line-0 `YYYY MM DD HH MM SS` into seconds since the GPS calendar origin
+     * (`1980-01-06 00:00:00`, with no leap seconds applied). For GPST/GST (`G`, `J`, `E`) and
+     * BDT (`C`, whose 2006-01-01 epoch is an exact integer multiple of weeks after GPS epoch),
+     * `epochSeconds.mod(SECONDS_IN_WEEK)` yields the exact constellation TOW (`toc`).
+     */
+    private fun parseLine0EpochSecondsFrom1980(line0: String): Double? {
+        if (line0.length < 23) return null
+        return try {
+            val year = line0.substring(4, 8).trim().toInt()
+            val month = line0.substring(9, 11).trim().toInt()
+            val day = line0.substring(12, 14).trim().toInt()
+            val hour = line0.substring(15, 17).trim().toInt()
+            val minute = line0.substring(18, 20).trim().toInt()
+            val second = line0.substring(21, 23).trim().toInt()
+            if (month !in 1..12 || day !in 1..31 || hour !in 0..23 || minute !in 0..59 || second !in 0..60) {
+                return null
+            }
+            val clampedSecond = if (second == 60) 59 else second
+            val extraSecond = if (second == 60) 1.0 else 0.0
+            val epochCalendar =
+                java.util.GregorianCalendar(java.util.TimeZone.getTimeZone("UTC")).apply {
+                    isLenient = false
+                    clear()
+                    set(year, month - 1, day, hour, minute, clampedSecond)
+                }
+            (epochCalendar.timeInMillis / 1000.0) + extraSecond - GnssMathUtils.GPS_EPOCH_UNIX_SECONDS
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     // ---- GPS/QZSS RINEX record (8 lines) ----
     private fun parseGpsRecord(
         record: List<String>,
         now: Long,
-        gpsTow: Double,
-    ): SatelliteEphemeris? {
+        constellationType: Int,
+    ): ParsedRecord? {
         return try {
             val l0 = record[0]
-            val svid = l0.substring(1, 3).trim().toInt()
+            val prn = l0.substring(1, 3).trim().toInt()
+            val svid = if (constellationType == Constellation.QZSS && prn in 1..10) 192 + prn else prn
             val af0 = parseRinexDouble(l0, 23, 19)
             val af1 = parseRinexDouble(l0, 42, 19)
             val af2 = parseRinexDouble(l0, 61, 19)
@@ -241,36 +331,41 @@ object BroadcastEphemerisProvider {
             if (health != 0) return null
             val tgd = parseRinexDouble(l6, 42, 19)
 
-            val l7 = record[7]
-            val toc = toe // RINEX stores epoch which maps to toc
+            val epochSec = parseLine0EpochSecondsFrom1980(l0)
+            val toc = epochSec?.mod(GnssMathUtils.SECONDS_IN_WEEK) ?: toe
+            val fullGpsSeconds = epochSec?.let { it + GnssMathUtils.wrapToHalfWeekSeconds(toe - toc) }
 
-            SatelliteEphemeris(
-                constellationType = Constellation.GPS,
-                svid = svid,
-                week = week,
-                iode = iode,
-                toe = toe,
-                toc = toc,
-                af0 = af0,
-                af1 = af1,
-                af2 = af2,
-                m0 = m0,
-                deltaN = deltaN,
-                eccentricity = eccentricity,
-                sqrtA = sqrtA,
-                omega0 = omega0,
-                i0 = i0,
-                omega = omega,
-                omegaDot = omegaDot,
-                iDot = iDot,
-                cuc = cuc,
-                cus = cus,
-                crc = crc,
-                crs = crs,
-                cic = cic,
-                cis = cis,
-                tgd = tgd,
-                lastUpdateTime = now,
+            ParsedRecord(
+                ephemeris =
+                    SatelliteEphemeris(
+                        constellationType = constellationType,
+                        svid = svid,
+                        week = week,
+                        iode = iode,
+                        toe = toe,
+                        toc = toc,
+                        af0 = af0,
+                        af1 = af1,
+                        af2 = af2,
+                        m0 = m0,
+                        deltaN = deltaN,
+                        eccentricity = eccentricity,
+                        sqrtA = sqrtA,
+                        omega0 = omega0,
+                        i0 = i0,
+                        omega = omega,
+                        omegaDot = omegaDot,
+                        iDot = iDot,
+                        cuc = cuc,
+                        cus = cus,
+                        crc = crc,
+                        crs = crs,
+                        cic = cic,
+                        cis = cis,
+                        tgd = tgd,
+                        lastUpdateTime = now,
+                    ),
+                fullGpsSeconds = fullGpsSeconds,
             )
         } catch (e: Exception) {
             null
@@ -281,8 +376,7 @@ object BroadcastEphemerisProvider {
     private fun parseGalileoRecord(
         record: List<String>,
         now: Long,
-        gpsTow: Double,
-    ): SatelliteEphemeris? {
+    ): ParsedRecord? {
         return try {
             val l0 = record[0]
             val svid = l0.substring(1, 3).trim().toInt()
@@ -329,36 +423,44 @@ object BroadcastEphemerisProvider {
             val inavClock = galileoClockIsInav(dataSources)
             val tgd = if (inavClock) bgdE1E5b else bgdE1E5a
 
-            SatelliteEphemeris(
-                constellationType = Constellation.GALILEO,
-                svid = svid,
-                week = week,
-                iode = iodNav,
-                toe = toe,
-                toc = toe,
-                af0 = af0,
-                af1 = af1,
-                af2 = af2,
-                m0 = m0,
-                deltaN = deltaN,
-                eccentricity = eccentricity,
-                sqrtA = sqrtA,
-                omega0 = omega0,
-                i0 = i0,
-                omega = omega,
-                omegaDot = omegaDot,
-                iDot = iDot,
-                cuc = cuc,
-                cus = cus,
-                crc = crc,
-                crs = crs,
-                cic = cic,
-                cis = cis,
-                tgd = tgd,
-                galileoBgdE1E5aSeconds = bgdE1E5a,
-                galileoBgdE1E5bSeconds = bgdE1E5b,
-                galileoInavClock = inavClock,
-                lastUpdateTime = now,
+            val epochSec = parseLine0EpochSecondsFrom1980(l0)
+            val toc = epochSec?.mod(GnssMathUtils.SECONDS_IN_WEEK) ?: toe
+            val fullGpsSeconds = epochSec?.let { it + GnssMathUtils.wrapToHalfWeekSeconds(toe - toc) }
+
+            ParsedRecord(
+                ephemeris =
+                    SatelliteEphemeris(
+                        constellationType = Constellation.GALILEO,
+                        svid = svid,
+                        week = week,
+                        iode = iodNav,
+                        toe = toe,
+                        toc = toc,
+                        af0 = af0,
+                        af1 = af1,
+                        af2 = af2,
+                        m0 = m0,
+                        deltaN = deltaN,
+                        eccentricity = eccentricity,
+                        sqrtA = sqrtA,
+                        omega0 = omega0,
+                        i0 = i0,
+                        omega = omega,
+                        omegaDot = omegaDot,
+                        iDot = iDot,
+                        cuc = cuc,
+                        cus = cus,
+                        crc = crc,
+                        crs = crs,
+                        cic = cic,
+                        cis = cis,
+                        tgd = tgd,
+                        galileoBgdE1E5aSeconds = bgdE1E5a,
+                        galileoBgdE1E5bSeconds = bgdE1E5b,
+                        galileoInavClock = inavClock,
+                        lastUpdateTime = now,
+                    ),
+                fullGpsSeconds = fullGpsSeconds,
             )
         } catch (e: Exception) {
             null
@@ -369,8 +471,8 @@ object BroadcastEphemerisProvider {
     private fun parseGlonassRecord(
         record: List<String>,
         now: Long,
-        gpsTow: Double,
-    ): SatelliteEphemeris? {
+        leapSeconds: Int,
+    ): ParsedRecord? {
         return try {
             val l0 = record[0]
             val svid = l0.substring(1, 3).trim().toInt()
@@ -404,42 +506,34 @@ object BroadcastEphemerisProvider {
             // line 0 — that field is the message frame time tk, up to ±15 min away from tb
             // (and week-seconds in some RINEX minor versions). Using tk as tb mislabeled the
             // state vector's reference time, propagating from the wrong instant.
-            val year = l0.substring(4, 8).trim().toInt()
-            val month = l0.substring(9, 11).trim().toInt()
-            val day = l0.substring(12, 14).trim().toInt()
-            val hour = l0.substring(15, 17).trim().toInt()
-            val minute = l0.substring(18, 20).trim().toInt()
-            val second = l0.substring(21, 23).trim().toInt()
-            val epochCalendar =
-                java.util.GregorianCalendar(java.util.TimeZone.getTimeZone("UTC")).apply {
-                    clear()
-                    set(year, month - 1, day, hour, minute, second)
-                }
-            val epochUnixSeconds = epochCalendar.timeInMillis / 1000.0
-            val epochGpsSeconds = epochUnixSeconds - GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + GnssMathUtils.GPS_UTC_LEAP_SECONDS
-            var tbGpsTow = epochGpsSeconds % 604800.0
-            if (tbGpsTow < 0) tbGpsTow += 604800.0
+            val epochSec = parseLine0EpochSecondsFrom1980(l0) ?: return null
+            val fullGpsSeconds = epochSec + leapSeconds
+            val tbGpsTow = fullGpsSeconds.mod(GnssMathUtils.SECONDS_IN_WEEK)
 
-            SatelliteEphemeris(
-                constellationType = Constellation.GLONASS,
-                svid = svid,
-                lastUpdateTime = now,
-                isGlonass = true,
-                gloPosX = posX,
-                gloPosY = posY,
-                gloPosZ = posZ,
-                gloVelX = velX,
-                gloVelY = velY,
-                gloVelZ = velZ,
-                gloAccX = accX,
-                gloAccY = accY,
-                gloAccZ = accZ,
-                gloTauN = tauN,
-                gloGammaN = gammaN,
-                gloTbGpsTow = tbGpsTow,
-                gloBn = health,
-                af0 = -tauN, // clock bias (GLONASS convention)
-                af1 = gammaN,
+            ParsedRecord(
+                ephemeris =
+                    SatelliteEphemeris(
+                        constellationType = Constellation.GLONASS,
+                        svid = svid,
+                        lastUpdateTime = now,
+                        isGlonass = true,
+                        gloPosX = posX,
+                        gloPosY = posY,
+                        gloPosZ = posZ,
+                        gloVelX = velX,
+                        gloVelY = velY,
+                        gloVelZ = velZ,
+                        gloAccX = accX,
+                        gloAccY = accY,
+                        gloAccZ = accZ,
+                        gloTauN = tauN,
+                        gloGammaN = gammaN,
+                        gloTbGpsTow = tbGpsTow,
+                        gloBn = health,
+                        af0 = -tauN, // clock bias (GLONASS convention)
+                        af1 = gammaN,
+                    ),
+                fullGpsSeconds = fullGpsSeconds,
             )
         } catch (e: Exception) {
             null
@@ -450,8 +544,7 @@ object BroadcastEphemerisProvider {
     private fun parseBeidouRecord(
         record: List<String>,
         now: Long,
-        gpsTow: Double,
-    ): SatelliteEphemeris? {
+    ): ParsedRecord? {
         return try {
             val l0 = record[0]
             val svid = l0.substring(1, 3).trim().toInt()
@@ -491,32 +584,43 @@ object BroadcastEphemerisProvider {
             if (satH1 != 0) return null
             val tgd = parseRinexDouble(l6, 42, 19)
 
-            SatelliteEphemeris(
-                constellationType = Constellation.BEIDOU,
-                svid = svid,
-                week = week,
-                toe = toe, // keep in BDT
-                toc = toe,
-                af0 = af0,
-                af1 = af1,
-                af2 = af2,
-                m0 = m0,
-                deltaN = deltaN,
-                eccentricity = eccentricity,
-                sqrtA = sqrtA,
-                omega0 = omega0,
-                i0 = i0,
-                omega = omega,
-                omegaDot = omegaDot,
-                iDot = iDot,
-                cuc = cuc,
-                cus = cus,
-                crc = crc,
-                crs = crs,
-                cic = cic,
-                cis = cis,
-                tgd = tgd,
-                lastUpdateTime = now,
+            val epochSec = parseLine0EpochSecondsFrom1980(l0)
+            val toc = epochSec?.mod(GnssMathUtils.SECONDS_IN_WEEK) ?: toe
+            val fullGpsSeconds =
+                epochSec?.let {
+                    it + GnssMathUtils.BDT_GPST_OFFSET_SECONDS + GnssMathUtils.wrapToHalfWeekSeconds(toe - toc)
+                }
+
+            ParsedRecord(
+                ephemeris =
+                    SatelliteEphemeris(
+                        constellationType = Constellation.BEIDOU,
+                        svid = svid,
+                        week = week,
+                        toe = toe, // keep in BDT
+                        toc = toc,
+                        af0 = af0,
+                        af1 = af1,
+                        af2 = af2,
+                        m0 = m0,
+                        deltaN = deltaN,
+                        eccentricity = eccentricity,
+                        sqrtA = sqrtA,
+                        omega0 = omega0,
+                        i0 = i0,
+                        omega = omega,
+                        omegaDot = omegaDot,
+                        iDot = iDot,
+                        cuc = cuc,
+                        cus = cus,
+                        crc = crc,
+                        crs = crs,
+                        cic = cic,
+                        cis = cis,
+                        tgd = tgd,
+                        lastUpdateTime = now,
+                    ),
+                fullGpsSeconds = fullGpsSeconds,
             )
         } catch (e: Exception) {
             null

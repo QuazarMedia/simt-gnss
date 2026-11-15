@@ -262,4 +262,62 @@ class BroadcastEphemerisProviderTest {
 
         assertEquals(0, BroadcastEphemerisProvider.parseRinex3MixedNav(truncated, now).size)
     }
+
+    @Test
+    fun keplerRecords_preserveDistinctLine0TocFromToe() {
+        // Line 0 is 2026-06-11 00:00:00 -> toc = 345,600.0 (Thursday 00:00:00 in GPST/BDT),
+        // while line 3 toe is 345,660.0 (60 s later). Both GPS, Galileo, and BeiDou must retain
+        // toc = 345,600.0 rather than overwriting toc = toe.
+        val now = 345_600.0
+        val toe = 345_660.0
+        val content =
+            rinex(
+                keplerRecord('G', 7, toe, now, line5Field2 = 0.0, health = 0.0) +
+                    keplerRecord('E', 11, toe, now, line5Field2 = 1.0, health = 0.0) +
+                    keplerRecord('C', 6, toe, now, line5Field2 = 0.0, health = 0.0),
+            )
+        val parsed = BroadcastEphemerisProvider.parseRinex3MixedNav(content, now)
+        assertEquals(3, parsed.size)
+        for (eph in parsed) {
+            assertEquals("toc must come from line 0 for constellation=${eph.constellationType}", 345_600.0, eph.toc, 1e-6)
+            assertEquals("toe must come from line 3 for constellation=${eph.constellationType}", 345_660.0, eph.toe, 1e-6)
+        }
+    }
+
+    @Test
+    fun beidouAgeAndDedup_accountsForBdtGpst14sOffset() {
+        val gpsTow = 345_600.0
+        // Record A is 600 s before gpsTow in GPST -> BDT toe = gpsTow - 14 - 600 = 344,986 s.
+        // Record B is 609 s after gpsTow in GPST -> BDT toe = gpsTow - 14 + 609 = 346,195 s.
+        // Without the +14 s BDT->GPST conversion, |gpsTow - 344_986| = 614 > |gpsTow - 346_195| = 595
+        // and Record B would win erroneously.
+        val recA = keplerRecord('C', 6, toe = 344_986.0, now = gpsTow, line5Field2 = 0.0, health = 0.0)
+        val recB = keplerRecord('C', 6, toe = 346_195.0, now = gpsTow, line5Field2 = 0.0, health = 0.0)
+        val chosen = BroadcastEphemerisProvider.parseRinex3MixedNav(rinex(recA + recB), gpsTow).single()
+        assertEquals(344_986.0, chosen.toe, 1e-6)
+    }
+
+    @Test
+    fun sevenDayOldRinexFile_isRejectedWhenFullGpsSecondsProvided() {
+        // 2026-06-11 00:00:00 GPST: same TOW (345,600 s) as 7 days later (2026-06-18 00:00:00 GPST).
+        val fileEpochUnix = OffsetDateTime.of(2026, 6, 11, 0, 0, 0, 0, ZoneOffset.UTC).toEpochSecond()
+        val fileFullGpsSec = (fileEpochUnix - 315_964_800L).toDouble()
+        val sevenDaysLaterFullGpsSec = fileFullGpsSec + 604_800.0
+        val content =
+            rinex(
+                keplerRecord('G', 7, toe = 345_600.0, now = 345_600.0, line5Field2 = 0.0, health = 0.0) +
+                    keplerRecord('C', 6, toe = 345_600.0, now = 345_600.0, line5Field2 = 0.0, health = 0.0),
+            )
+
+        // Fresh at the file's own epoch:
+        assertEquals(
+            2,
+            BroadcastEphemerisProvider.parseRinex3MixedNav(content, 345_600.0, fileFullGpsSec).size,
+        )
+        // 7 days later (identical TOW, but 604,800 s older): must be rejected!
+        assertEquals(
+            0,
+            BroadcastEphemerisProvider.parseRinex3MixedNav(content, 345_600.0, sevenDaysLaterFullGpsSec).size,
+        )
+    }
 }
