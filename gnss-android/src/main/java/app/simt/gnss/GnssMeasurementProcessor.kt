@@ -14,6 +14,7 @@ import app.simt.gnss.core.correction.SsrCorrections
 import app.simt.gnss.core.filter.DopplerSmoother
 import app.simt.gnss.core.filter.GnssInterEpochKalmanFilter
 import app.simt.gnss.core.filter.HatchFilter
+import app.simt.gnss.core.filter.KalmanCoast
 import app.simt.gnss.core.filter.carrierDeltaMatchesPseudorangeRate
 import app.simt.gnss.core.filter.receiverClockStepMeters
 import app.simt.gnss.core.model.Constellation
@@ -123,6 +124,8 @@ internal class GnssMeasurementProcessor(
 
     internal fun getLastKnownLeapSecondsForTest(): Int = synchronized(lock) { lastKnownLeapSeconds }
 
+    internal fun getKalmanCoastForTest(): KalmanCoast? = synchronized(lock) { interEpochKalman.coastReport() }
+
     private val gpsLastBits = mutableMapOf<Pair<Int, Int>, Int>()
     private var ionoAlpha: DoubleArray? = null
     private var ionoBeta: DoubleArray? = null
@@ -145,6 +148,48 @@ internal class GnssMeasurementProcessor(
             dopplerSmoother.reset()
             interEpochKalman.reset()
         }
+
+    internal fun hasActivePppOrSsrState(gpsTimeNanos: Long = 0L): Boolean =
+        synchronized(lock) {
+            pppState.getLastPositionEcef(currentTimeNanos = gpsTimeNanos) != null ||
+                ssrStore.hasValidCorrections
+        }
+
+    internal fun resetSession(
+        preserveEphemeris: Boolean = true,
+        clearCorrections: Boolean = true,
+    ) = synchronized(lock) {
+        pppState.reset()
+        interEpochKalman.reset()
+        hatchFilter.reset()
+        dopplerSmoother.reset()
+        clearTdcp()
+        rtkAmbiguityMemory.clear()
+        lastFullBiasNanos = null
+        lastBiasNanos = 0.0
+        epochClockStepMeters = 0.0
+        lastHardwareClockDiscontinuityCount = null
+
+        if (clearCorrections) {
+            ssrStore.clear()
+            rtkBaseStore.clear()
+            sbasFastCorrections.clear()
+            sbasLongTermCorrections.clear()
+        }
+        if (!preserveEphemeris) {
+            ephemerisMap.clear()
+            subframeStorage.clear()
+            glonassStringStorage.clear()
+            galileoWordStorage.clear()
+            gpsCnavIscMap.clear()
+            gpsLastBits.clear()
+            sbasPrnMasks.clear()
+            ionoAlpha = null
+            ionoBeta = null
+            hasGpsTimeOfWeek = false
+            lastGpsTimeOfWeekSeconds = 0.0
+        }
+    }
 
     /**
      * Seed position for the next epoch, plus the ambiguity and zenith-wet-delay holders a
@@ -923,6 +968,16 @@ internal class GnssMeasurementProcessor(
         lonDeg: Double,
     ): Pair<Double, Double> {
         val (vx, vy, vz) = interEpochKalman.velocityEcef()
+        return speedAndBearingFromVelocityEcef(vx, vy, vz, latDeg, lonDeg)
+    }
+
+    private fun speedAndBearingFromVelocityEcef(
+        vx: Double,
+        vy: Double,
+        vz: Double,
+        latDeg: Double,
+        lonDeg: Double,
+    ): Pair<Double, Double> {
         val (east, north, _) = GnssMathUtils.ecefDeltaToEnu(vx, vy, vz, latDeg, lonDeg)
         var bearing = Math.toDegrees(atan2(east, north))
         if (bearing < 0.0) bearing += 360.0
@@ -1464,6 +1519,7 @@ internal class GnssMeasurementProcessor(
         usePpp: Boolean = true,
         gpsTimeNanos: Long = 0L,
         accuracy: Accuracy = Accuracy.HIGH,
+        commitState: Boolean = true,
     ): PositionResult? =
         synchronized(lock) {
             if (measurements.size < 4) return null
@@ -1759,11 +1815,11 @@ internal class GnssMeasurementProcessor(
                     for (i in activeMeasurements.indices) {
                         val meas = activeMeasurements[i]
                         val satKey = meas.constellationType to meas.svid
-                        val ephemeris = usableEphemerisBySat[satKey]
+                        val ephemeris = usableEphemerisBySat[satKey] ?: continue
 
                         val gpstSeconds = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
                         val currentTimeSeconds = if (meas.constellationType == GnssStatus.CONSTELLATION_BEIDOU) gpstSeconds - GnssMathUtils.BDT_GPST_OFFSET_SECONDS else gpstSeconds
-                        val ssrPair = ephemeris?.let { getApplicableSsrPair(meas.constellationType, meas.svid, it, usePpp) }
+                        val ssrPair = getApplicableSsrPair(meas.constellationType, meas.svid, ephemeris, usePpp)
 
                         val clockGroupId = clockGroupBySatKey[satKey] ?: meas.constellationType
                         val currentConstellationBias =
@@ -1778,13 +1834,14 @@ internal class GnssMeasurementProcessor(
                         // skipping the per-iteration Kepler solve and Klobuchar evaluation. The
                         // line-of-sight, range, relativistic (Shapiro) and residual below are still rebuilt
                         // every iteration from the current receiver position.
-                        val cachedModel = if (ephemeris != null && !coarsePositionEstimate) svModelCache[satKey] else null
-                        val reuseModel =
-                            cachedModel != null &&
-                                abs(currentX - cachedModel.refX) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS &&
-                                abs(currentY - cachedModel.refY) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS &&
-                                abs(currentZ - cachedModel.refZ) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS &&
-                                abs(currentConstellationBias - cachedModel.refClockBias) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS
+                        val cachedModel = if (!coarsePositionEstimate) svModelCache[satKey] else null
+                        val reusableModel =
+                            cachedModel?.takeIf {
+                                abs(currentX - it.refX) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS &&
+                                    abs(currentY - it.refY) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS &&
+                                    abs(currentZ - it.refZ) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS &&
+                                    abs(currentConstellationBias - it.refClockBias) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS
+                            }
 
                         val satX: Double
                         val satY: Double
@@ -1795,118 +1852,100 @@ internal class GnssMeasurementProcessor(
                         val ionoDelayL1: Double
                         val satClockCorr: Double
 
-                        if (reuseModel && cachedModel != null) {
-                            satX = cachedModel.satX
-                            satY = cachedModel.satY
-                            satZ = cachedModel.satZ
-                            iterElevationDeg = cachedModel.elevationDeg
-                            iterAzimuthDeg = cachedModel.azimuthDeg
-                            dryDelay = cachedModel.dryDelay
-                            ionoDelayL1 = cachedModel.ionoDelayL1
-                            satClockCorr = cachedModel.satClockMeters
+                        if (reusableModel != null) {
+                            satX = reusableModel.satX
+                            satY = reusableModel.satY
+                            satZ = reusableModel.satZ
+                            iterElevationDeg = reusableModel.elevationDeg
+                            iterAzimuthDeg = reusableModel.azimuthDeg
+                            dryDelay = reusableModel.dryDelay
+                            ionoDelayL1 = reusableModel.ionoDelayL1
+                            satClockCorr = reusableModel.satClockMeters
                         } else {
                             // The pseudorange and currentTimeSeconds share the receiver clock, so it
                             // cancels in the transmit epoch (t = t_rx − PR/c − Δt_sv). The flight
                             // time that rotates ECEF keeps the estimated clock: (PR − b̂)/c + Δt_sv.
                             // One clock evaluation at t_rx − PR/c is enough; af1 across Δt_sv is noise.
+                            val approxFlight =
+                                (meas.pseudorangeMeters / SPEED_OF_LIGHT)
+                                    .coerceIn(MIN_TRAVEL_TIME_SECONDS, MAX_TRAVEL_TIME_SECONDS)
+                            val satelliteClockSeconds =
+                                SatellitePositionCalculator.getSatelliteClockCorrection(
+                                    ephemeris,
+                                    currentTimeSeconds - approxFlight,
+                                    includeGroupDelay = false,
+                                )
                             val transmitTiming =
-                                if (ephemeris != null) {
-                                    val approxFlight =
-                                        (meas.pseudorangeMeters / SPEED_OF_LIGHT)
-                                            .coerceIn(MIN_TRAVEL_TIME_SECONDS, MAX_TRAVEL_TIME_SECONDS)
-                                    val satelliteClockSeconds =
-                                        SatellitePositionCalculator.getSatelliteClockCorrection(
-                                            ephemeris,
-                                            currentTimeSeconds - approxFlight,
-                                            includeGroupDelay = false,
-                                        )
-                                    SatellitePositionCalculator.transmitTiming(
-                                        receptionTimeSeconds = currentTimeSeconds,
-                                        pseudorangeMeters = meas.pseudorangeMeters,
-                                        receiverClockBiasMeters = currentConstellationBias,
-                                        satelliteClockSeconds = satelliteClockSeconds,
-                                    )
-                                } else {
-                                    null
-                                }
+                                SatellitePositionCalculator.transmitTiming(
+                                    receptionTimeSeconds = currentTimeSeconds,
+                                    pseudorangeMeters = meas.pseudorangeMeters,
+                                    receiverClockBiasMeters = currentConstellationBias,
+                                    satelliteClockSeconds = satelliteClockSeconds,
+                                )
+                            val travelTime =
+                                transmitTiming.rotationSeconds.coerceIn(MIN_TRAVEL_TIME_SECONDS, MAX_TRAVEL_TIME_SECONDS)
+                            val txTime = transmitTiming.transmitTimeSeconds
+                            val (tx, ty, tz) =
+                                SatellitePositionCalculator.calculateSatellitePosition(
+                                    ephemeris,
+                                    txTime,
+                                )
+                            val (rx, ry, rz) =
+                                SatellitePositionCalculator.rotateEcefForEarthRotationDuringTransit(
+                                    transmitX = tx,
+                                    transmitY = ty,
+                                    transmitZ = tz,
+                                    transitTimeSeconds = travelTime,
+                                )
+                            // Apply SSR orbit correction if available. Gated on the broadcast
+                            // ephemeris IOD and atomic orbit+clock pairing (with usePpp).
+                            val ssrOrbit = ssrPair?.first
                             val (computedSatX, computedSatY, computedSatZ) =
-                                if (ephemeris != null) {
-                                    val travelTime =
-                                        (transmitTiming?.rotationSeconds ?: 0.0)
-                                            .coerceIn(MIN_TRAVEL_TIME_SECONDS, MAX_TRAVEL_TIME_SECONDS)
-                                    val txTime = transmitTiming?.transmitTimeSeconds ?: currentTimeSeconds
-                                    val (tx, ty, tz) =
-                                        SatellitePositionCalculator.calculateSatellitePosition(
+                                if (ssrOrbit != null) {
+                                    val vel =
+                                        SsrCorrectionApplicator.computeSatelliteVelocity(
                                             ephemeris,
                                             txTime,
+                                            Triple(tx, ty, tz),
+                                            SatellitePositionCalculator::calculateSatellitePosition,
                                         )
-                                    val (rx, ry, rz) =
-                                        SatellitePositionCalculator.rotateEcefForEarthRotationDuringTransit(
-                                            transmitX = tx,
-                                            transmitY = ty,
-                                            transmitZ = tz,
-                                            transitTimeSeconds = travelTime,
+                                    val dtSsr =
+                                        ssrPolynomialAgeSeconds(
+                                            epochTime = ssrOrbit.epochTime,
+                                            updateIntervalSeconds = ssrOrbit.updateIntervalSeconds,
+                                            timescale = ssrOrbit.epochTimescale,
+                                            gpstSeconds = gpstSeconds,
+                                            currentTimeSeconds = currentTimeSeconds,
                                         )
-                                    // Apply SSR orbit correction if available. Gated on the broadcast
-                                    // ephemeris IOD and atomic orbit+clock pairing (with usePpp).
-                                    val ssrOrbit = ssrPair?.first
-                                    if (ssrOrbit != null) {
-                                        val vel =
-                                            SsrCorrectionApplicator.computeSatelliteVelocity(
-                                                ephemeris,
-                                                txTime,
-                                                Triple(tx, ty, tz),
-                                                SatellitePositionCalculator::calculateSatellitePosition,
-                                            )
-                                        val dtSsr =
-                                            ssrPolynomialAgeSeconds(
-                                                epochTime = ssrOrbit.epochTime,
-                                                updateIntervalSeconds = ssrOrbit.updateIntervalSeconds,
-                                                timescale = ssrOrbit.epochTimescale,
-                                                gpstSeconds = gpstSeconds,
-                                                currentTimeSeconds = currentTimeSeconds,
-                                            )
-                                        val beidouGeo =
-                                            meas.constellationType == GnssStatus.CONSTELLATION_BEIDOU &&
-                                                (meas.svid in 1..5 || meas.svid in 59..63)
-                                        SsrCorrectionApplicator.applyOrbitCorrection(
-                                            rx,
-                                            ry,
-                                            rz,
-                                            vel.first,
-                                            vel.second,
-                                            vel.third,
-                                            ssrOrbit.deltaRadial + ssrOrbit.dotRadial * dtSsr,
-                                            ssrOrbit.deltaAlongTrack + ssrOrbit.dotAlongTrack * dtSsr,
-                                            ssrOrbit.deltaCrossTrack + ssrOrbit.dotCrossTrack * dtSsr,
-                                            nonRotatingVelocity = beidouGeo,
-                                        )
-                                    } else {
-                                        // Apply SBAS long-term orbit correction if available
-                                        // (GPS only, IODE-matched to this broadcast ephemeris)
-                                        val sbasLtc =
-                                            if (meas.constellationType == GnssStatus.CONSTELLATION_GPS) {
-                                                getSbasLongTermCorrection(meas.svid, ephemeris.iode)
-                                            } else {
-                                                null
-                                            }
-                                        if (sbasLtc != null) {
-                                            Triple(rx + sbasLtc.deltaX, ry + sbasLtc.deltaY, rz + sbasLtc.deltaZ)
-                                        } else {
-                                            Triple(rx, ry, rz)
-                                        }
-                                    }
-                                } else {
-                                    // No ephemeris — use approximate satellite position from the
-                                    // fixed seed (not the WLS iterate) to avoid circular dependency.
-                                    SatellitePositionCalculator.getSatellitePositionApproximation(
-                                        constellationType = meas.constellationType,
-                                        elevation = meas.elevationDegrees,
-                                        azimuth = meas.azimuthDegrees,
-                                        observerLat = initialLat,
-                                        observerLon = initialLon,
-                                        observerAlt = initialAlt,
+                                    val beidouGeo =
+                                        meas.constellationType == GnssStatus.CONSTELLATION_BEIDOU &&
+                                            (meas.svid in 1..5 || meas.svid in 59..63)
+                                    SsrCorrectionApplicator.applyOrbitCorrection(
+                                        rx,
+                                        ry,
+                                        rz,
+                                        vel.first,
+                                        vel.second,
+                                        vel.third,
+                                        ssrOrbit.deltaRadial + ssrOrbit.dotRadial * dtSsr,
+                                        ssrOrbit.deltaAlongTrack + ssrOrbit.dotAlongTrack * dtSsr,
+                                        ssrOrbit.deltaCrossTrack + ssrOrbit.dotCrossTrack * dtSsr,
+                                        nonRotatingVelocity = beidouGeo,
                                     )
+                                } else {
+                                    // Apply SBAS long-term orbit correction if available
+                                    // (GPS only, IODE-matched to this broadcast ephemeris)
+                                    val sbasLtc =
+                                        if (meas.constellationType == GnssStatus.CONSTELLATION_GPS) {
+                                            getSbasLongTermCorrection(meas.svid, ephemeris.iode)
+                                        } else {
+                                            null
+                                        }
+                                    if (sbasLtc != null) {
+                                        Triple(rx + sbasLtc.deltaX, ry + sbasLtc.deltaY, rz + sbasLtc.deltaZ)
+                                    } else {
+                                        Triple(rx, ry, rz)
+                                    }
                                 }
                             satX = computedSatX
                             satY = computedSatY
@@ -1951,80 +1990,75 @@ internal class GnssMeasurementProcessor(
                                     AtmosphericCorrection.computeIonosphericDelay(iterElevationDeg, iterAzimuthDeg, observerLat, observerLon, gpsTimeNanos / 1_000_000L, ionoAlpha, ionoBeta)
                                 }
 
-                            satClockCorr =
-                                if (ephemeris != null) {
-                                    val clockTimeSec = transmitTiming?.transmitTimeSeconds ?: currentTimeSeconds
-                                    // Satellite clock WITHOUT the broadcast group delay; the
-                                    // signal-specific term is applied below. GPS/BeiDou: none on the
-                                    // LNAV ionosphere-free path, plain TGD for CNAV/BeiDou, γ·TGD
-                                    // on one frequency. Galileo (OS SIS ICD §5.1.5): the clock's own
-                                    // BGD on E1, and for an I/NAV clock the E5a and E1/E5a formulas
-                                    // that convert it onto the F/NAV reference.
-                                    var clockMeters =
-                                        SatellitePositionCalculator.getSatelliteClockCorrection(
-                                            ephemeris,
-                                            clockTimeSec,
-                                            includeGroupDelay = false,
-                                        ) * SPEED_OF_LIGHT
-                                    val groupDelaySeconds =
-                                        groupDelaySecondsForMeasurement(
-                                            ephemeris = ephemeris,
-                                            constellationType = meas.constellationType,
-                                            carrierFrequencyHz = meas.carrierFrequencyHz,
-                                            ionosphereFree = satKey in ifCorrectedSatKeys,
-                                            clockExcludesGroupDelay = satKey in ifClockWithoutGroupDelaySatKeys || satKey in ssrCodeBiasAppliedSatKeys,
-                                            lowerBandHz = ifPairComponentsBySat[satKey]?.fLowHz ?: GnssMathUtils.L5_FREQUENCY_HZ,
-                                        )
-                                    if (groupDelaySeconds.isFinite() && groupDelaySeconds != 0.0) {
-                                        clockMeters -= groupDelaySeconds * SPEED_OF_LIGHT
+                            val clockTimeSec = transmitTiming.transmitTimeSeconds
+                            // Satellite clock WITHOUT the broadcast group delay; the
+                            // signal-specific term is applied below. GPS/BeiDou: none on the
+                            // LNAV ionosphere-free path, plain TGD for CNAV/BeiDou, γ·TGD
+                            // on one frequency. Galileo (OS SIS ICD §5.1.5): the clock's own
+                            // BGD on E1, and for an I/NAV clock the E5a and E1/E5a formulas
+                            // that convert it onto the F/NAV reference.
+                            var clockMeters =
+                                SatellitePositionCalculator.getSatelliteClockCorrection(
+                                    ephemeris,
+                                    clockTimeSec,
+                                    includeGroupDelay = false,
+                                ) * SPEED_OF_LIGHT
+                            val groupDelaySeconds =
+                                groupDelaySecondsForMeasurement(
+                                    ephemeris = ephemeris,
+                                    constellationType = meas.constellationType,
+                                    carrierFrequencyHz = meas.carrierFrequencyHz,
+                                    ionosphereFree = satKey in ifCorrectedSatKeys,
+                                    clockExcludesGroupDelay = satKey in ifClockWithoutGroupDelaySatKeys || satKey in ssrCodeBiasAppliedSatKeys,
+                                    lowerBandHz = ifPairComponentsBySat[satKey]?.fLowHz ?: GnssMathUtils.L5_FREQUENCY_HZ,
+                                )
+                            if (groupDelaySeconds.isFinite() && groupDelaySeconds != 0.0) {
+                                clockMeters -= groupDelaySeconds * SPEED_OF_LIGHT
+                            }
+                            // Apply SSR clock correction if available (atomic orbit+clock pairing)
+                            val ssrClock = ssrPair?.second
+                            if (ssrClock != null) {
+                                val dtSsr =
+                                    ssrPolynomialAgeSeconds(
+                                        epochTime = ssrClock.epochTime,
+                                        updateIntervalSeconds = ssrClock.updateIntervalSeconds,
+                                        timescale = ssrClock.epochTimescale,
+                                        gpstSeconds = gpstSeconds,
+                                        currentTimeSeconds = currentTimeSeconds,
+                                    )
+                                clockMeters = SsrCorrectionApplicator.applyClockCorrection(clockMeters, ssrClock.c0, ssrClock.c1, ssrClock.c2, dtSsr)
+                                val hrClock =
+                                    if (ssrClock.iodSsr >= 0) {
+                                        ssrStore.getHighRateClock(meas.constellationType, meas.svid, ssrClock.iodSsr)
+                                    } else {
+                                        null
                                     }
-                                    // Apply SSR clock correction if available (atomic orbit+clock pairing)
-                                    val ssrClock = ssrPair?.second
-                                    if (ssrClock != null) {
-                                        val dtSsr =
+                                if (hrClock != null) {
+                                    val dtHr =
+                                        abs(
                                             ssrPolynomialAgeSeconds(
-                                                epochTime = ssrClock.epochTime,
-                                                updateIntervalSeconds = ssrClock.updateIntervalSeconds,
-                                                timescale = ssrClock.epochTimescale,
+                                                epochTime = hrClock.epochTime,
+                                                updateIntervalSeconds = hrClock.updateIntervalSeconds,
+                                                timescale = hrClock.epochTimescale,
                                                 gpstSeconds = gpstSeconds,
                                                 currentTimeSeconds = currentTimeSeconds,
-                                            )
-                                        clockMeters = SsrCorrectionApplicator.applyClockCorrection(clockMeters, ssrClock.c0, ssrClock.c1, ssrClock.c2, dtSsr)
-                                        val hrClock =
-                                            if (ssrClock.iodSsr >= 0) {
-                                                ssrStore.getHighRateClock(meas.constellationType, meas.svid, ssrClock.iodSsr)
-                                            } else {
-                                                null
-                                            }
-                                        if (hrClock != null) {
-                                            val dtHr =
-                                                abs(
-                                                    ssrPolynomialAgeSeconds(
-                                                        epochTime = hrClock.epochTime,
-                                                        updateIntervalSeconds = hrClock.updateIntervalSeconds,
-                                                        timescale = hrClock.epochTimescale,
-                                                        gpstSeconds = gpstSeconds,
-                                                        currentTimeSeconds = currentTimeSeconds,
-                                                    ),
-                                                )
-                                            if (dtHr <= max(30.0, 2.0 * hrClock.updateIntervalSeconds)) {
-                                                clockMeters += hrClock.deltaClockMeters
-                                            }
-                                        }
-                                    } else {
-                                        // SBAS fast (PRC) and long-term clock corrections are an
-                                        // *alternative* to SSR, not additive: both correct the same
-                                        // broadcast clock error, so stacking them on an SSR clock
-                                        // would double-correct (mirrors the orbit-side precedence).
-                                        clockMeters += getSbasFastCorrectionMeters(meas.constellationType, meas.svid)
-                                        clockMeters += getSbasLongTermClockCorrectionMeters(meas.constellationType, meas.svid, ephemeris.iode)
+                                            ),
+                                        )
+                                    if (dtHr <= max(30.0, 2.0 * hrClock.updateIntervalSeconds)) {
+                                        clockMeters += hrClock.deltaClockMeters
                                     }
-                                    clockMeters
-                                } else {
-                                    0.0
                                 }
+                            } else {
+                                // SBAS fast (PRC) and long-term clock corrections are an
+                                // *alternative* to SSR, not additive: both correct the same
+                                // broadcast clock error, so stacking them on an SSR clock
+                                // would double-correct (mirrors the orbit-side precedence).
+                                clockMeters += getSbasFastCorrectionMeters(meas.constellationType, meas.svid)
+                                clockMeters += getSbasLongTermClockCorrectionMeters(meas.constellationType, meas.svid, ephemeris.iode)
+                            }
+                            satClockCorr = clockMeters
 
-                            if (ephemeris != null && !coarsePositionEstimate) {
+                            if (!coarsePositionEstimate) {
                                 svModelCache[satKey] =
                                     SvModelTerms(
                                         refX = currentX,
@@ -2151,7 +2185,7 @@ internal class GnssMeasurementProcessor(
                             } else {
                                 GnssMathUtils.observationSigmaMeters(
                                     sigmaCode,
-                                    if (ephemeris == null) 0.0 else ephemerisAgeSeconds(ephemeris, currentTimeSeconds),
+                                    ephemerisAgeSeconds(ephemeris, currentTimeSeconds),
                                 )
                             }
                         measurementSigmas[i] = sigma
@@ -2374,7 +2408,7 @@ internal class GnssMeasurementProcessor(
                             gpstSeconds,
                         )
                     val displacement =
-                        if (gpsTimeNanos > 0L) {
+                        if (commitState && gpsTimeNanos > 0L) {
                             tdcpDisplacement(
                                 activeMeasurements,
                                 clockBiases,
@@ -2384,11 +2418,11 @@ internal class GnssMeasurementProcessor(
                                 gpsTimeNanos,
                             )
                         } else {
-                            clearTdcp()
+                            if (commitState) clearTdcp()
                             null
                         }
                     val (outX, outY, outZ) =
-                        if (gpsTimeNanos > 0L) {
+                        if (commitState && gpsTimeNanos > 0L) {
                             // Measurement covariance for the Kalman = a-posteriori variance factor ×
                             // the metric formal covariance (dimensionally correct m²), instead of the
                             // previous residualsRms² × covariance which double-counted the noise scale.
@@ -2408,32 +2442,34 @@ internal class GnssMeasurementProcessor(
                                 relativeDisplacementCovarianceM2 = displacement?.covarianceEcef,
                             )
                         } else {
-                            interEpochKalman.reset()
+                            if (commitState) interEpochKalman.reset()
                             wlsEcef
                         }
 
                     val (lat, lon, alt) = GnssMathUtils.ecefToLatLonAlt(outX, outY, outZ)
-                    if (gpsTimeNanos > 0L) {
-                        rememberTdcp(
-                            activeMeasurements,
-                            outX,
-                            outY,
-                            outZ,
-                            clockBiases,
-                            clockGroupToIndex,
-                            clockGroupBySatKey,
-                            gpstSeconds,
-                            gpsTimeNanos,
-                        )
+                    if (commitState) {
+                        if (gpsTimeNanos > 0L) {
+                            rememberTdcp(
+                                activeMeasurements,
+                                outX,
+                                outY,
+                                outZ,
+                                clockBiases,
+                                clockGroupToIndex,
+                                clockGroupBySatKey,
+                                gpstSeconds,
+                                gpsTimeNanos,
+                            )
+                        }
+                        pppState.updatePosition(outX, outY, outZ, gpsTimeNanos)
                     }
-                    pppState.updatePosition(outX, outY, outZ, gpsTimeNanos)
 
                     val dopsAndAccuracy = computeDopsAndAccuracy(solutionWrapper.covarianceMatrix, dopMatrix, lat, lon, lastVarianceFactor, numClockStates)
 
                     // Accepted fixes keep the WLS accuracy. A coasted epoch publishes the
                     // prediction, so its accuracy is the predicted covariance, and at least
                     // the horizontal gap to the measurement that was rejected.
-                    val coast = interEpochKalman.coastReport()
+                    val coast = if (commitState) interEpochKalman.coastReport() else null
                     val covHorizontalAccuracy: Float
                     val covVerticalAccuracy: Float
                     if (coast == null) {
@@ -2487,7 +2523,20 @@ internal class GnssMeasurementProcessor(
 
                     val horizontalAcc = covHorizontalAccuracy.coerceIn(horizontalAccuracyFloor, effectiveMaxHorizontal)
                     val verticalAcc = covVerticalAccuracy.coerceIn(verticalAccuracyFloor, effectiveMaxVertical)
-                    val speedAndBearing = if (doppler == null) null else speedAndBearingDegrees(lat, lon)
+                    val speedAndBearing =
+                        if (doppler == null) {
+                            null
+                        } else if (commitState) {
+                            speedAndBearingDegrees(lat, lon)
+                        } else {
+                            speedAndBearingFromVelocityEcef(
+                                doppler.velocityX,
+                                doppler.velocityY,
+                                doppler.velocityZ,
+                                lat,
+                                lon,
+                            )
+                        }
 
                     return@synchronized PositionResult(
                         latitude = lat,
@@ -3064,6 +3113,39 @@ internal class GnssMeasurementProcessor(
                     degreesOfFreedom = degreesOfFreedom,
                     isFloatMode = fixedSolution == null,
                 )
+            val rtkSigma0 =
+                if (fixedSolution == null && (degreesOfFreedom <= 0 || residualRms == 0.0)) {
+                    refSigma
+                } else {
+                    residualRms.coerceAtLeast(RTK_ACCURACY_SIGMA0_FLOOR_METERS)
+                }
+            val rtkVarianceFactor = (rtkSigma0 / refSigma).pow(2).coerceAtLeast(1.0)
+            val rtkPosCovariance =
+                Array(3) { ri ->
+                    DoubleArray(3) { cj ->
+                        rtkVarianceFactor * covariance[ri][cj]
+                    }
+                }
+            val doppler =
+                dopplerVelocity(
+                    measurements = measurements,
+                    receiverX = roverEcef[0],
+                    receiverY = roverEcef[1],
+                    receiverZ = roverEcef[2],
+                    clockBiases = DoubleArray(1) { 0.0 },
+                    clockGroupToIndex = emptyMap(),
+                    clockGroupBySatKey = emptyMap(),
+                    gpstSeconds = gpstSeconds,
+                )
+            interEpochKalman.syncToExternalFix(
+                positionEcef = Triple(roverEcef[0], roverEcef[1], roverEcef[2]),
+                positionCovarianceEcef = rtkPosCovariance,
+                timeNanos = gpsTimeNanos,
+                velocityEcef = doppler?.let { Triple(it.velocityX, it.velocityY, it.velocityZ) },
+                velocityCovarianceEcef = doppler?.covarianceEcef,
+            )
+            clearTdcp()
+            val speedAndBearing = if (doppler == null) null else speedAndBearingDegrees(lat, lon)
             Log.d(
                 TAG,
                 "RTK $mode: sats=$usedCount hAcc=${"%.2f".format(accuracy.horizontalMeters)}m rms=${"%.2f".format(residualRms)}m ${rtkBaseStore.describe()}",
@@ -3085,6 +3167,8 @@ internal class GnssMeasurementProcessor(
                 satelliteCount = measurements.distinctBy { it.constellationType to it.svid }.size,
                 usedInFixCount = usedCount,
                 solutionMode = if (fixedSolution != null) GnssSolutionMode.RTK_FIXED else GnssSolutionMode.RTK_FLOAT,
+                speedMetersPerSecond = speedAndBearing?.first,
+                bearingDegrees = speedAndBearing?.second,
             )
         }
 
