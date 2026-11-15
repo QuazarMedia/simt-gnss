@@ -32,6 +32,7 @@ class RtkBaseStore(
         val yMeters: Double,
         val zMeters: Double,
         val receivedAtMs: Long,
+        val referenceStationId: Int = -1,
     )
 
     private data class StoredObservation(
@@ -101,12 +102,28 @@ class RtkBaseStore(
         return Key(constellationType, svid, (frequencyHz / 1e6).roundToInt())
     }
 
+    private fun matchesStation(
+        baseStationId: Int?,
+        obsStationId: Int,
+    ): Boolean =
+        baseStationId == null ||
+            baseStationId < 0 ||
+            obsStationId < 0 ||
+            baseStationId == obsStationId
+
     fun setBasePosition(
         xMeters: Double,
         yMeters: Double,
         zMeters: Double,
+        referenceStationId: Int = -1,
     ) = synchronized(lock) {
-        basePosition = BasePosition(xMeters, yMeters, zMeters, nowMs())
+        basePosition = BasePosition(xMeters, yMeters, zMeters, nowMs(), referenceStationId)
+        if (referenceStationId >= 0) {
+            observations.entries.removeAll {
+                val obsStation = it.value.observation.referenceStationId
+                obsStation >= 0 && obsStation != referenceStationId
+            }
+        }
     }
 
     /** Returns the surveyed base position, or null if none/stale. */
@@ -132,6 +149,7 @@ class RtkBaseStore(
                 }
                 val existing = observations[key]
                 if (existing != null && existing.observation.epochTimeMs == obs.epochTimeMs &&
+                    existing.observation.referenceStationId == obs.referenceStationId &&
                     signalPreferenceRank(obs.constellationType, existing.observation.signalId) <=
                     signalPreferenceRank(obs.constellationType, obs.signalId)
                 ) {
@@ -150,7 +168,12 @@ class RtkBaseStore(
         synchronized(lock) {
             val key = keyFor(constellationType, svid, frequencyHz) ?: return null
             val stored = observations[key] ?: return null
-            if (nowMs() - stored.receivedAtMs >= maxObservationAgeMs) return null
+            val now = nowMs()
+            if (now - stored.receivedAtMs >= maxObservationAgeMs) return null
+            val activePosition = basePosition?.takeIf { now - it.receivedAtMs < maxPositionAgeMs }
+            if (!matchesStation(activePosition?.referenceStationId, stored.observation.referenceStationId)) {
+                return null
+            }
             // Serve only observations from the constellation's latest epoch: a satellite that
             // dropped out of the newest base epoch must not be served from an older one next
             // to fresh ones (the base clock difference between epochs corrupts the DD).
@@ -161,12 +184,12 @@ class RtkBaseStore(
     /** True when a fresh base position and at least [minObservations] fresh, current-epoch observations exist. */
     fun hasFreshData(minObservations: Int = 4): Boolean =
         synchronized(lock) {
-            if (basePosition?.let { nowMs() - it.receivedAtMs < maxPositionAgeMs } != true) {
-                return false
-            }
             val now = nowMs()
+            val activePosition =
+                basePosition?.takeIf { now - it.receivedAtMs < maxPositionAgeMs } ?: return false
             observations.values.count {
                 now - it.receivedAtMs < maxObservationAgeMs &&
+                    matchesStation(activePosition.referenceStationId, it.observation.referenceStationId) &&
                     it.observation.epochTimeMs == latestEpochMsByConstellation[it.observation.constellationType]
             } >= minObservations
         }
@@ -188,8 +211,12 @@ class RtkBaseStore(
     fun describe(): String =
         synchronized(lock) {
             val now = nowMs()
-            val freshObs = observations.values.count { now - it.receivedAtMs < maxObservationAgeMs }
-            val hasPos = basePosition?.let { now - it.receivedAtMs < maxPositionAgeMs } == true
-            "RTK base: position=${if (hasPos) "fresh" else "none"} observations=$freshObs"
+            val activePosition = basePosition?.takeIf { now - it.receivedAtMs < maxPositionAgeMs }
+            val freshObs =
+                observations.values.count {
+                    now - it.receivedAtMs < maxObservationAgeMs &&
+                        matchesStation(activePosition?.referenceStationId, it.observation.referenceStationId)
+                }
+            "RTK base: position=${if (activePosition != null) "fresh" else "none"} observations=$freshObs"
         }
 }

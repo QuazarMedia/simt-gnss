@@ -352,6 +352,13 @@ object GnssMathUtils {
      */
     const val KALMAN_MAX_SPEED_MPS: Double = 120.0
 
+    /**
+     * Maximum base–rover baseline (metres) for which RTK double-differencing is attempted. Beyond
+     * 50 km, residual tropospheric and ionospheric decorrelation breaks float/integer validity and
+     * single-frequency RTK degrades below dual-frequency absolute positioning.
+     */
+    const val MAX_RTK_BASELINE_METERS: Double = 50_000.0
+
     fun cn0WeightFactor(cn0DbHz: Double): Double {
         val exponent = (cn0DbHz - CN0_REFERENCE_DB_HZ) / 10.0
         return 10.0.pow(exponent)

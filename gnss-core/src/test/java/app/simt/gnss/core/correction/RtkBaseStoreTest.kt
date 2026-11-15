@@ -148,4 +148,37 @@ class RtkBaseStoreEpochCoherenceTest {
         org.junit.Assert.assertFalse(store.hasFreshData(minObservations = 4))
         org.junit.Assert.assertTrue(store.hasFreshData(minObservations = 2))
     }
+
+    @org.junit.Test
+    fun stationIdMismatch_rejectsObservationsUntilBasePositionMatches() {
+        store.setBasePosition(1.0, 2.0, 3.0, referenceStationId = 100)
+        val station200Obs =
+            (1..4).map { svid ->
+                app.simt.gnss.core.parser.RtcmMsmParser.BaseObservation(
+                    constellationType = Constellation.GPS,
+                    svid = svid,
+                    carrierFrequencyHz = 1.57542e9,
+                    pseudorangeMeters = 2.0e7,
+                    carrierPhaseMeters = null,
+                    cnrDbHz = 45.0,
+                    epochTimeMs = 1000L,
+                    signalId = 2,
+                    referenceStationId = 200,
+                )
+            }
+        store.putObservations(station200Obs)
+
+        org.junit.Assert.assertNull(store.getObservation(Constellation.GPS, 1, 1.57542e9))
+        org.junit.Assert.assertFalse(store.hasFreshData(minObservations = 1))
+
+        // Once 1005/1006 arrives for station 200, those observations match and are served.
+        store.setBasePosition(10.0, 20.0, 30.0, referenceStationId = 200)
+        org.junit.Assert.assertNotNull(store.getObservation(Constellation.GPS, 1, 1.57542e9))
+        org.junit.Assert.assertTrue(store.hasFreshData(minObservations = 4))
+
+        // Switching base back to station 100 evicts station 200 observations.
+        store.setBasePosition(1.0, 2.0, 3.0, referenceStationId = 100)
+        org.junit.Assert.assertNull(store.getObservation(Constellation.GPS, 1, 1.57542e9))
+        org.junit.Assert.assertFalse(store.hasFreshData(minObservations = 1))
+    }
 }

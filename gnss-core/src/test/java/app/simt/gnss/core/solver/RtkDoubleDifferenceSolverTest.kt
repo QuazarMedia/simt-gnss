@@ -1,5 +1,6 @@
 package app.simt.gnss.core.solver
 
+import app.simt.gnss.core.model.Constellation
 import app.simt.gnss.core.utils.GnssMathUtils
 import app.simt.gnss.core.utils.GnssMathUtils.SPEED_OF_LIGHT
 import org.junit.Assert.assertEquals
@@ -187,6 +188,154 @@ class RtkDoubleDifferenceSolverTest {
         assertTrue("partial fix should stay centimetre-class, was $error m", error < 0.05)
         assertTrue("the half-cycle satellite should be left out, used ${fixed.usedSatelliteCount}", fixed.usedSatelliteCount < scenario.carrierInputs.size)
         assertTrue(fixed.ratio >= 3.0)
+    }
+
+    @Test
+    fun solveFixed_keepsValidPriorsWithTenCycleCodeNoiseAndRejectsSingleFiveCycleSlip() {
+        val scenario = buildCarrierScenario(carrierNoiseMeters = 0.005)
+        // Inject 2.0 m (~10.5 L1 cycles) code error on SV 2 (index 1) while keeping carrier clean (5 mm).
+        val noisyCodeInputs =
+            scenario.codeInputs.mapIndexed { idx, input ->
+                if (idx == 1) input.copy(roverObservationMeters = input.roverObservationMeters + 2.0) else input
+            }
+        val noisyCarrierInputs =
+            scenario.carrierInputs.mapIndexed { idx, input ->
+                if (idx == 1) input.copy(roverCodeMeters = input.roverCodeMeters + 2.0) else input
+            }
+        val floatSolution = RtkDoubleDifferenceSolver.solve(scenario.baseEcef, noisyCodeInputs, scenario.baseEcef)
+        requireNotNull(floatSolution)
+
+        var carriedWithValidPriors = emptyList<RtkDoubleDifferenceSolver.AmbiguityState>()
+        val fixedWithValidPriors =
+            RtkDoubleDifferenceSolver.solveFixed(
+                baseEcef = scenario.baseEcef,
+                inputs = noisyCarrierInputs,
+                initialRover = scenario.baseEcef,
+                floatRoverEcef = floatSolution.roverEcef,
+                priors = carriedPriors(scenario, cycleOffset = 0.0),
+                onFloat = { carriedWithValidPriors = it },
+                maxFixFloatSeparationMeters = 10.0,
+            )
+
+        assertNotNull("valid priors must survive 2 m (~10 cycles) code noise on one SV", fixedWithValidPriors)
+        assertEquals(6, carriedWithValidPriors.size)
+        assertTrue(
+            "fixed solution with valid priors should be cm-class, was ${distance(fixedWithValidPriors!!.roverEcef, scenario.roverTrueEcef)} m",
+            distance(fixedWithValidPriors.roverEcef, scenario.roverTrueEcef) < 0.05,
+        )
+
+        // Now corrupt ONLY SV 2's prior by +5 cycles; the corrupted prior must be dropped while the others fix.
+        val slippedPriors =
+            carriedPriors(scenario, cycleOffset = 0.0).map { prior ->
+                if (prior.satSvid == 2) prior.copy(cycles = prior.cycles + 5.0) else prior
+            }
+        val fixedAfterSlipDropped =
+            RtkDoubleDifferenceSolver.solveFixed(
+                baseEcef = scenario.baseEcef,
+                inputs = noisyCarrierInputs,
+                initialRover = scenario.baseEcef,
+                floatRoverEcef = floatSolution.roverEcef,
+                priors = slippedPriors,
+                maxFixFloatSeparationMeters = 10.0,
+            )
+        assertNotNull("dropping the single 5-cycle slipped prior should still allow the clean priors to fix", fixedAfterSlipDropped)
+        assertTrue(
+            distance(fixedAfterSlipDropped!!.roverEcef, scenario.roverTrueEcef) < 0.05,
+        )
+    }
+
+    @Test
+    fun solveFixed_pivotsCarriedAmbiguitiesWhenReferenceSatelliteSwitchesOrDrops() {
+        val scenario = buildCarrierScenario(carrierNoiseMeters = 0.002)
+        val floatSolution = RtkDoubleDifferenceSolver.solve(scenario.baseEcef, scenario.codeInputs, scenario.baseEcef)
+        requireNotNull(floatSolution)
+
+        // Epoch 1: converge priors with refSvid = 1 (72 deg).
+        var epoch1Priors = emptyList<RtkDoubleDifferenceSolver.AmbiguityState>()
+        val epoch1Fixed =
+            RtkDoubleDifferenceSolver.solveFixed(
+                baseEcef = scenario.baseEcef,
+                inputs = scenario.carrierInputs,
+                initialRover = scenario.baseEcef,
+                floatRoverEcef = floatSolution.roverEcef,
+                priors = carriedPriors(scenario, cycleOffset = 0.0),
+                onFloat = { epoch1Priors = it },
+            )
+        assertNotNull(epoch1Fixed)
+        assertTrue(epoch1Priors.all { it.refSvid == 1 })
+
+        // Epoch 2a: raise SV 2 to 82 deg (10 deg above SV 1 at 72 deg) with 6 cm carrier noise so it needs priors.
+        val noisyScenario = buildCarrierScenario(carrierNoiseMeters = 0.06)
+        val raisedSv2Inputs =
+            noisyScenario.carrierInputs.map { input ->
+                if (input.svid == 2) input.copy(elevationDeg = 82.0) else input
+            }
+        var pivotedOut = emptyList<RtkDoubleDifferenceSolver.AmbiguityState>()
+        val epoch2Fixed =
+            RtkDoubleDifferenceSolver.solveFixed(
+                baseEcef = noisyScenario.baseEcef,
+                inputs = raisedSv2Inputs,
+                initialRover = noisyScenario.baseEcef,
+                floatRoverEcef = floatSolution.roverEcef,
+                priors = epoch1Priors,
+                onFloat = { pivotedOut = it },
+            )
+        assertNotNull("pivoted priors should fix noisy epoch immediately", epoch2Fixed)
+        assertTrue("new reference should be SV 2", pivotedOut.all { it.refSvid == 2 })
+        assertTrue(distance(epoch2Fixed!!.roverEcef, noisyScenario.roverTrueEcef) < 0.25)
+
+        // Epoch 2b: drop SV 1 completely; SV 7 (64 deg) becomes the new highest-elevation reference.
+        val droppedSv1Inputs = noisyScenario.carrierInputs.filter { it.svid != 1 }
+        var droppedRefOut = emptyList<RtkDoubleDifferenceSolver.AmbiguityState>()
+        val epoch2DroppedFixed =
+            RtkDoubleDifferenceSolver.solveFixed(
+                baseEcef = noisyScenario.baseEcef,
+                inputs = droppedSv1Inputs,
+                initialRover = noisyScenario.baseEcef,
+                floatRoverEcef = floatSolution.roverEcef,
+                priors = epoch1Priors,
+                onFloat = { droppedRefOut = it },
+            )
+        assertNotNull("dropping old ref should still pivot surviving priors to SV 7", epoch2DroppedFixed)
+        assertTrue("new reference should be SV 7", droppedRefOut.all { it.refSvid == 7 })
+    }
+
+    @Test
+    fun solveFixed_excludesGlonassInputsSafely() {
+        val scenario = buildCarrierScenario(carrierNoiseMeters = 0.002)
+        val floatSolution = RtkDoubleDifferenceSolver.solve(scenario.baseEcef, scenario.codeInputs, scenario.baseEcef)
+        requireNotNull(floatSolution)
+
+        val gpsInputs = scenario.carrierInputs.map { it.copy(constellationType = Constellation.GPS) }
+        val glonassInputs =
+            scenario.carrierInputs.take(2).mapIndexed { idx, input ->
+                input.copy(
+                    constellationType = Constellation.GLONASS,
+                    svid = 10 + idx,
+                    wavelengthMeters = SPEED_OF_LIGHT / (1_602_000_000.0 + idx * 562_500.0),
+                    roverCarrierMeters = input.roverCarrierMeters + 123.45,
+                )
+            }
+
+        // GLONASS-only must return null; mixed GPS + GLONASS excludes GLONASS and still fixes cleanly on GPS.
+        assertNull(
+            RtkDoubleDifferenceSolver.solveFixed(
+                baseEcef = scenario.baseEcef,
+                inputs = glonassInputs,
+                initialRover = scenario.baseEcef,
+                floatRoverEcef = floatSolution.roverEcef,
+            ),
+        )
+        val mixedFixed =
+            RtkDoubleDifferenceSolver.solveFixed(
+                baseEcef = scenario.baseEcef,
+                inputs = gpsInputs + glonassInputs,
+                initialRover = scenario.baseEcef,
+                floatRoverEcef = floatSolution.roverEcef,
+            )
+        assertNotNull(mixedFixed)
+        assertEquals(gpsInputs.size, mixedFixed!!.usedSatelliteCount)
+        assertTrue(distance(mixedFixed.roverEcef, scenario.roverTrueEcef) < 0.05)
     }
 
     private fun carriedPriors(

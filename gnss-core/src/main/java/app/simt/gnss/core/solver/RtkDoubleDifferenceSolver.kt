@@ -1,4 +1,6 @@
 package app.simt.gnss.core.solver
+import app.simt.gnss.core.model.Constellation
+import app.simt.gnss.core.utils.GnssMathUtils
 import app.simt.gnss.core.utils.GnssMathUtils.SPEED_OF_LIGHT
 import kotlin.math.abs
 import kotlin.math.max
@@ -76,6 +78,7 @@ object RtkDoubleDifferenceSolver {
         /** 3×3 ECEF position covariance (unit-weight), scale by σ₀² for a metric covariance. */
         val covariance: Array<DoubleArray>,
         val usedSatelliteCount: Int,
+        val degreesOfFreedom: Int = 0,
     )
 
     /** Per-row pairing of a satellite index with its partition's reference-satellite index. */
@@ -101,7 +104,43 @@ object RtkDoubleDifferenceSolver {
 
     private fun codePartitionKey(input: SatelliteInput): Any = input.constellationType to input.bandMhz
 
-    private fun carrierPartitionKey(input: CarrierSatelliteInput): Any = input.constellationType to (input.wavelengthMeters * 1e4).roundToInt()
+    private fun carrierPartitionKey(input: CarrierSatelliteInput): Any = input.constellationType to (input.wavelengthMeters * 1e5).roundToInt()
+
+    private fun buildCarrierRows(
+        items: List<CarrierSatelliteInput>,
+        priors: List<AmbiguityState>,
+    ): List<DdRow> {
+        val byPartition = items.indices.groupBy { carrierPartitionKey(items[it]) }
+        val rows = ArrayList<DdRow>(items.size)
+        for ((_, indices) in byPartition) {
+            if (indices.size < 2) continue
+            val maxElevIndex = indices.maxByOrNull { items[it].elevationDeg } ?: continue
+            val maxElev = items[maxElevIndex].elevationDeg
+            val sample = items[indices.first()]
+            val activePriorRefs =
+                priors
+                    .filter {
+                        it.constellationType == sample.constellationType &&
+                            abs(it.wavelengthMeters - sample.wavelengthMeters) < WAVELENGTH_MATCH_TOLERANCE_METERS
+                    }.mapTo(HashSet()) { it.refSvid }
+            val hysteresisRef =
+                if (activePriorRefs.isEmpty()) {
+                    null
+                } else {
+                    indices
+                        .filter {
+                            items[it].svid in activePriorRefs &&
+                                items[it].elevationDeg >= maxElev - REF_HYSTERESIS_DEG &&
+                                items[it].elevationDeg >= MIN_HYSTERESIS_REF_ELEVATION_DEG
+                        }.maxByOrNull { items[it].elevationDeg }
+                }
+            val ref = hysteresisRef ?: maxElevIndex
+            for (i in indices) {
+                if (i != ref) rows.add(DdRow(i, ref))
+            }
+        }
+        return rows
+    }
 
     /**
      * @param initialRover starting estimate (the base position is a fine seed for a short baseline).
@@ -169,6 +208,7 @@ object RtkDoubleDifferenceSolver {
                 residualRms = residualRms,
                 covariance = solution.covarianceMatrix,
                 usedSatelliteCount = active.size,
+                degreesOfFreedom = (rows.size - 3).coerceAtLeast(0),
             )
         }
         return null
@@ -189,6 +229,14 @@ object RtkDoubleDifferenceSolver {
     /** A carried ambiguity further than this from the new float is a slip the Doppler test missed. */
     private const val AMBIGUITY_DISAGREEMENT_CYCLES = 0.5
     private const val AMBIGUITY_DISAGREEMENT_SIGMA = 4.0
+    private const val REF_HYSTERESIS_DEG = 3.0
+    private const val MIN_HYSTERESIS_REF_ELEVATION_DEG = 15.0
+    private const val WAVELENGTH_MATCH_TOLERANCE_METERS = 1e-5
+    private const val PRIOR_CARRIER_FLOOR_METERS = 0.10
+    private const val PRIOR_CARRIER_RESIDUAL_FLOOR_METERS = 0.25
+    private const val PRIOR_CARRIER_RESIDUAL_SIGMA = 4.0
+    private const val PRIOR_POSITION_CHI2_LIMIT = 11.3
+    private const val PRIOR_PULL_SIGMA_LIMIT = 4.0
 
     data class CarrierSatelliteInput(
         val satelliteEcef: DoubleArray,
@@ -226,6 +274,7 @@ object RtkDoubleDifferenceSolver {
         val covariance: Array<DoubleArray>,
         val usedSatelliteCount: Int,
         val ratio: Double,
+        val degreesOfFreedom: Int = 0,
     )
 
     /**
@@ -236,17 +285,18 @@ object RtkDoubleDifferenceSolver {
      * yielding a centimetre-class fix.
      *
      * Double differences are formed per (constellation, wavelength) partition; the DD ambiguity is
-     * an integer only when both satellites share the same wavelength and system.
+     * an integer only when both satellites share the same wavelength and system. GLONASS inputs are
+     * excluded because FDMA wavelengths differ per satellite and cannot form integer-valued DDs
+     * across satellites.
      *
      * Returns null whenever fixing is not safe (too few carrier satellites, the ratio test
      * fails, or the fixed position disagrees with the float). The caller must then keep its float
      * solution: this method never degrades the float result, it can only upgrade it.
      *
-     * [priors] are previous-epoch double-difference ambiguities. One that disagrees with this
-     * epoch's unconstrained float is dropped. The rest enter the float system as their own
-     * variance, and [onFloat] receives the posterior whether or not a fix is published.
-     * Integer search retries without the loosest ambiguity, re-solving that subset, until the
-     * ratio test passes or fewer than [MIN_PARTIAL_AMBIGUITIES] remain.
+     * [priors] are previous-epoch double-difference ambiguities. Priors are pivoted onto the
+     * current reference satellite when the reference switches, gated against the unconstrained
+     * float's combined innovation variance plus post-fit consistency, and the surviving subset's
+     * posterior is passed to [onFloat] after partial-fix subsetting.
      */
     fun solveFixed(
         baseEcef: DoubleArray,
@@ -256,36 +306,71 @@ object RtkDoubleDifferenceSolver {
         ratioThreshold: Double = LambdaAmbiguityResolver.DEFAULT_RATIO_THRESHOLD,
         priors: List<AmbiguityState> = emptyList(),
         onFloat: (List<AmbiguityState>) -> Unit = {},
+        maxFixFloatSeparationMeters: Double = MAX_FIX_FLOAT_SEPARATION_METERS,
     ): FixedSolution? {
-        if (inputs.size < MIN_FIX_SATELLITES) return null
-        val rows = buildRows(inputs, ::carrierPartitionKey) { it.elevationDeg }
+        val activeInputs = inputs.filter { it.constellationType != Constellation.GLONASS }
+        if (activeInputs.size < MIN_FIX_SATELLITES) return null
+        val rows = buildCarrierRows(activeInputs, priors)
         val ambiguityCount = rows.size
         if (ambiguityCount < MIN_PARTIAL_AMBIGUITIES) return null
 
-        val baseRange = DoubleArray(inputs.size) { distance(inputs[it].baseSatelliteEcef, baseEcef) }
-        val sdCode = DoubleArray(inputs.size) { inputs[it].roverCodeMeters - inputs[it].baseCodeMeters }
-        val sdCarrier = DoubleArray(inputs.size) { inputs[it].roverCarrierMeters - inputs[it].baseCarrierMeters }
+        val pivotedPriors = pivotPriors(activeInputs, rows, priors)
+        val baseRange = DoubleArray(activeInputs.size) { distance(activeInputs[it].baseSatelliteEcef, baseEcef) }
+        val sdCode = DoubleArray(activeInputs.size) { activeInputs[it].roverCodeMeters - activeInputs[it].baseCodeMeters }
+        val sdCarrier = DoubleArray(activeInputs.size) { activeInputs[it].roverCarrierMeters - activeInputs[it].baseCarrierMeters }
 
         val unconstrained =
-            iterateFloat(initialRover, inputs, rows, baseRange, sdCode, sdCarrier, emptyList()) ?: return null
+            iterateFloat(initialRover, activeInputs, rows, baseRange, sdCode, sdCarrier, emptyList()) ?: return null
         val kept =
-            priors.filter { prior ->
-                val index = ambiguityIndex(inputs, rows, prior)
-                if (index < 0) return@filter false
-                val limit =
-                    max(
-                        AMBIGUITY_DISAGREEMENT_CYCLES,
-                        AMBIGUITY_DISAGREEMENT_SIGMA * sqrt(prior.varianceCycles2.coerceAtLeast(0.0)),
-                    )
-                abs(unconstrained.ambiguities[index] - prior.cycles) <= limit
+            pivotedPriors
+                .filter { prior ->
+                    val index = ambiguityIndex(activeInputs, rows, prior)
+                    if (index < 0) return@filter false
+                    if (!prior.cycles.isFinite() || !prior.varianceCycles2.isFinite() || prior.varianceCycles2 <= 0.0) {
+                        return@filter false
+                    }
+                    val unconstrainedVar =
+                        unconstrained.covariance
+                            .getOrNull(index)
+                            ?.getOrNull(index)
+                            ?.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+                    val innovSigma = sqrt(unconstrainedVar + prior.varianceCycles2)
+                    val limit = max(AMBIGUITY_DISAGREEMENT_CYCLES, AMBIGUITY_DISAGREEMENT_SIGMA * innovSigma)
+                    abs(unconstrained.ambiguities[index] - prior.cycles) <= limit
+                }.toMutableList()
+
+        var estimate = unconstrained
+        var evictedPriorCount = 0
+        while (kept.isNotEmpty()) {
+            if (evictedPriorCount > 0 && kept.size < MIN_PARTIAL_AMBIGUITIES) {
+                kept.clear()
+                estimate = unconstrained
+                break
             }
-        val estimate =
-            if (kept.isEmpty()) {
-                unconstrained
-            } else {
-                iterateFloat(unconstrained.position, inputs, rows, baseRange, sdCode, sdCarrier, kept) ?: unconstrained
+            val candidate =
+                iterateFloat(unconstrained.position, activeInputs, rows, baseRange, sdCode, sdCarrier, kept)
+            if (candidate == null) {
+                kept.clear()
+                estimate = unconstrained
+                break
             }
-        onFloat(floatStates(inputs, rows, estimate.ambiguities, estimate.covariance))
+            val inconsistentIndex =
+                findInconsistentPriorIndex(
+                    inputs = activeInputs,
+                    rows = rows,
+                    baseRange = baseRange,
+                    sdCarrier = sdCarrier,
+                    unconstrained = unconstrained,
+                    candidate = candidate,
+                    kept = kept,
+                )
+            if (inconsistentIndex < 0) {
+                estimate = candidate
+                break
+            }
+            kept.removeAt(inconsistentIndex)
+            evictedPriorCount++
+        }
 
         // A weak ambiguity is left float and the rest are re-solved without it. Subsetting the
         // joint covariance leaves the correlation with the weak satellite in the rest, so the
@@ -307,20 +392,26 @@ object RtkDoubleDifferenceSolver {
             if (activeRows.size == MIN_PARTIAL_AMBIGUITIES) break
             val worst = activeEstimate.covariance.indices.maxByOrNull { activeEstimate.covariance[it][it] } ?: break
             activeRows = activeRows.filterIndexed { index, _ -> index != worst }
-            val reducedPriors = kept.filter { ambiguityIndex(inputs, activeRows, it) >= 0 }
-            activeEstimate =
+            val reducedPriors = kept.filter { ambiguityIndex(activeInputs, activeRows, it) >= 0 }
+            val nextEstimate =
                 iterateFloat(
                     activeEstimate.position,
-                    inputs,
+                    activeInputs,
                     activeRows,
                     baseRange,
                     sdCode,
                     sdCarrier,
                     reducedPriors,
-                ) ?: return null
+                ) ?: break
+            activeEstimate = nextEstimate
         }
-        val fixedRows = acceptedRows ?: return null
-        val fixedAmbiguities = acceptedCycles ?: return null
+
+        val fixedRows = acceptedRows
+        val fixedAmbiguities = acceptedCycles
+        if (fixedRows == null || fixedAmbiguities == null) {
+            onFloat(cleanFloatStates(activeInputs, rows, baseRange, sdCarrier, estimate))
+            return null
+        }
         val ratio = acceptedRatio
 
         var xFixed = activeEstimate.position.copyOf()
@@ -328,8 +419,12 @@ object RtkDoubleDifferenceSolver {
         var finalSystem: LinearSystem? = null
         var finalSolution: GnssPositionSolver.WlsSolution? = null
         for (iter in 0 until MAX_ITERATIONS) {
-            val system = buildFixedSystem(xFixed, inputs, fixedRows, baseRange, sdCarrier, fixedAmbiguities)
-            val solution = GnssPositionSolver.solve(system.a, system.b, system.w, needCovariance = fixedConverged) ?: return null
+            val system = buildFixedSystem(xFixed, activeInputs, fixedRows, baseRange, sdCarrier, fixedAmbiguities)
+            val solution = GnssPositionSolver.solve(system.a, system.b, system.w, needCovariance = fixedConverged)
+            if (solution == null) {
+                onFloat(cleanFloatStates(activeInputs, rows, baseRange, sdCarrier, estimate))
+                return null
+            }
             xFixed = doubleArrayOf(xFixed[0] + solution.deltaX[0], xFixed[1] + solution.deltaX[1], xFixed[2] + solution.deltaX[2])
             if (fixedConverged) {
                 finalSystem = system
@@ -340,11 +435,20 @@ object RtkDoubleDifferenceSolver {
                 fixedConverged = true
             }
         }
-        val system = finalSystem ?: return null
-        val solution = finalSolution ?: return null
+        val system = finalSystem
+        val solution = finalSolution
+        if (system == null || solution == null) {
+            onFloat(cleanFloatStates(activeInputs, rows, baseRange, sdCarrier, estimate))
+            return null
+        }
 
         // Last guard: a correct fix must agree with the validated code-float position.
-        if (distance(xFixed, floatRoverEcef) > MAX_FIX_FLOAT_SEPARATION_METERS) return null
+        if (distance(xFixed, floatRoverEcef) > maxFixFloatSeparationMeters) {
+            onFloat(cleanFloatStates(activeInputs, rows, baseRange, sdCarrier, estimate))
+            return null
+        }
+
+        onFloat(floatStates(activeInputs, activeRows, activeEstimate.ambiguities, activeEstimate.covariance))
 
         var sumSq = 0.0
         for (row in fixedRows.indices) {
@@ -362,6 +466,7 @@ object RtkDoubleDifferenceSolver {
             covariance = solution.covarianceMatrix,
             usedSatelliteCount = used,
             ratio = ratio,
+            degreesOfFreedom = (fixedRows.size - 3).coerceAtLeast(0),
         )
     }
 
@@ -369,6 +474,7 @@ object RtkDoubleDifferenceSolver {
         val position: DoubleArray,
         val ambiguities: DoubleArray,
         val covariance: Array<DoubleArray>,
+        val positionCovariance: Array<DoubleArray>,
     )
 
     private fun iterateFloat(
@@ -383,6 +489,7 @@ object RtkDoubleDifferenceSolver {
         var x = initialRover.copyOf()
         var ambiguityFloat: DoubleArray? = null
         var ambiguityCovariance: Array<DoubleArray>? = null
+        var positionCovariance: Array<DoubleArray>? = null
         var converged = false
         for (iter in 0 until MAX_ITERATIONS) {
             val system = buildFloatSystem(x, inputs, rows, baseRange, sdCode, sdCarrier, priors)
@@ -394,6 +501,10 @@ object RtkDoubleDifferenceSolver {
                     Array(rows.size) { i ->
                         DoubleArray(rows.size) { j -> solution.covarianceMatrix[3 + i][3 + j] }
                     }
+                positionCovariance =
+                    Array(3) { i ->
+                        DoubleArray(3) { j -> solution.covarianceMatrix[i][j] }
+                    }
                 break
             }
             if (norm(doubleArrayOf(solution.deltaX[0], solution.deltaX[1], solution.deltaX[2])) < CONVERGENCE_METERS) {
@@ -402,7 +513,203 @@ object RtkDoubleDifferenceSolver {
         }
         val ambiguities = ambiguityFloat ?: return null
         val covariance = ambiguityCovariance ?: return null
-        return FloatEstimate(x, ambiguities, covariance)
+        val posCovariance = positionCovariance ?: return null
+        return FloatEstimate(x, ambiguities, covariance, posCovariance)
+    }
+
+    private fun pivotPriors(
+        inputs: List<CarrierSatelliteInput>,
+        rows: List<DdRow>,
+        priors: List<AmbiguityState>,
+    ): List<AmbiguityState> {
+        if (priors.isEmpty()) return emptyList()
+        val result = ArrayList<AmbiguityState>(priors.size)
+        val rowsByPartition = rows.groupBy { carrierPartitionKey(inputs[it.satIndex]) }
+        for ((_, partitionRows) in rowsByPartition) {
+            val refSat = inputs[partitionRows.first().refIndex]
+            val newRefSvid = refSat.svid
+            if (newRefSvid < 0) continue
+            val partitionPriors =
+                priors.filter {
+                    it.constellationType == refSat.constellationType &&
+                        abs(it.wavelengthMeters - refSat.wavelengthMeters) < WAVELENGTH_MATCH_TOLERANCE_METERS &&
+                        it.cycles.isFinite() &&
+                        it.varianceCycles2.isFinite() &&
+                        it.varianceCycles2 > 0.0
+                }
+            for (prior in partitionPriors) {
+                if (prior.refSvid == newRefSvid) result += prior
+            }
+            val oldRefSvids = partitionPriors.map { it.refSvid }.distinct().filter { it != newRefSvid }
+            for (oldRefSvid in oldRefSvids) {
+                val pivot =
+                    partitionPriors.firstOrNull {
+                        it.refSvid == oldRefSvid && it.satSvid == newRefSvid
+                    } ?: continue
+                for (prior in partitionPriors) {
+                    if (prior.refSvid != oldRefSvid) continue
+                    if (prior.satSvid == newRefSvid) {
+                        result +=
+                            prior.copy(
+                                satSvid = oldRefSvid,
+                                refSvid = newRefSvid,
+                                cycles = -pivot.cycles,
+                                varianceCycles2 = pivot.varianceCycles2,
+                            )
+                    } else {
+                        result +=
+                            prior.copy(
+                                refSvid = newRefSvid,
+                                cycles = prior.cycles - pivot.cycles,
+                                varianceCycles2 = prior.varianceCycles2 + pivot.varianceCycles2,
+                            )
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private fun findInconsistentPriorIndex(
+        inputs: List<CarrierSatelliteInput>,
+        rows: List<DdRow>,
+        baseRange: DoubleArray,
+        sdCarrier: DoubleArray,
+        unconstrained: FloatEstimate,
+        candidate: FloatEstimate,
+        kept: List<AmbiguityState>,
+    ): Int {
+        val m = kept.size
+        val rowIndices = IntArray(m) { ambiguityIndex(inputs, rows, kept[it]) }
+        val d = DoubleArray(m)
+        val s = Array(m) { DoubleArray(m) }
+        for (i in 0 until m) {
+            val ri = rowIndices[i]
+            if (ri < 0) return i
+            d[i] = unconstrained.ambiguities[ri] - kept[i].cycles
+            val floorCycles = PRIOR_CARRIER_FLOOR_METERS / inputs[rows[ri].satIndex].wavelengthMeters
+            for (j in 0 until m) {
+                val rj = rowIndices[j]
+                s[i][j] = unconstrained.covariance[ri][rj]
+                if (i == j) {
+                    s[i][j] += kept[i].varianceCycles2 + floorCycles * floorCycles
+                }
+            }
+        }
+        val sInv = GnssMathUtils.invertSquareMatrix(s)
+        var mahalanobisChi2 = 0.0
+        var baardaWorstIndex = -1
+        var baardaWorstStat = -1.0
+        if (sInv != null) {
+            val z = DoubleArray(m)
+            for (i in 0 until m) {
+                var sum = 0.0
+                for (j in 0 until m) sum += sInv[i][j] * d[j]
+                z[i] = sum
+                mahalanobisChi2 += d[i] * sum
+            }
+            for (i in 0 until m) {
+                val diag = sInv[i][i]
+                val stat = if (diag > 1e-12) (z[i] * z[i]) / diag else 0.0
+                if (stat > baardaWorstStat) {
+                    baardaWorstStat = stat
+                    baardaWorstIndex = i
+                }
+            }
+        }
+
+        var maxPullSigma = 0.0
+        var maxCarrierRes = 0.0
+        var maxCarrierExceeded = false
+        for ((index, row) in rows.withIndex()) {
+            val sat = row.satIndex
+            val ref = row.refIndex
+            val ddGeom =
+                (distance(candidate.position, inputs[sat].satelliteEcef) - baseRange[sat]) -
+                    (distance(candidate.position, inputs[ref].satelliteEcef) - baseRange[ref])
+            val residualMeters =
+                abs((sdCarrier[sat] - sdCarrier[ref]) - ddGeom - inputs[sat].wavelengthMeters * candidate.ambiguities[index])
+            if (residualMeters > maxCarrierRes) maxCarrierRes = residualMeters
+            val satSigma = inputs[sat].carrierSigmaMeters
+            val refSigma = inputs[ref].carrierSigmaMeters
+            val ddCarrierSigma = sqrt(2.0 * (satSigma * satSigma + refSigma * refSigma))
+            if (residualMeters > max(PRIOR_CARRIER_RESIDUAL_FLOOR_METERS, PRIOR_CARRIER_RESIDUAL_SIGMA * ddCarrierSigma)) {
+                maxCarrierExceeded = true
+            }
+        }
+
+        val dx =
+            doubleArrayOf(
+                candidate.position[0] - unconstrained.position[0],
+                candidate.position[1] - unconstrained.position[1],
+                candidate.position[2] - unconstrained.position[2],
+            )
+        val qPosInv = GnssMathUtils.invertSquareMatrix(unconstrained.positionCovariance)
+        var posChi2 = 0.0
+        if (qPosInv != null) {
+            for (i in 0 until 3) {
+                for (j in 0 until 3) {
+                    posChi2 += dx[i] * qPosInv[i][j] * dx[j]
+                }
+            }
+        }
+
+        var worstPullIndex = -1
+        var worstScore = -1.0
+        for ((kIdx, prior) in kept.withIndex()) {
+            val rowIdx = rowIndices[kIdx]
+            val priorPullSigma = abs(candidate.ambiguities[rowIdx] - prior.cycles) / sqrt(prior.varianceCycles2)
+            if (priorPullSigma > maxPullSigma) maxPullSigma = priorPullSigma
+            val innovVar =
+                (unconstrained.covariance.getOrNull(rowIdx)?.getOrNull(rowIdx) ?: 0.0).coerceAtLeast(0.0) +
+                    prior.varianceCycles2
+            val innovScore = abs(unconstrained.ambiguities[rowIdx] - prior.cycles) / sqrt(innovVar)
+            val score = max(priorPullSigma, innovScore)
+            if (score > worstScore) {
+                worstScore = score
+                worstPullIndex = kIdx
+            }
+        }
+
+        val chi2Exceeded = sInv != null && mahalanobisChi2 > (11.0 + 3.0 * m)
+        val inconsistent =
+            chi2Exceeded || maxCarrierExceeded || maxPullSigma > PRIOR_PULL_SIGMA_LIMIT || posChi2 > PRIOR_POSITION_CHI2_LIMIT
+        if (!inconsistent) return -1
+        return if (chi2Exceeded && baardaWorstIndex >= 0) baardaWorstIndex else worstPullIndex
+    }
+
+    private fun cleanFloatStates(
+        inputs: List<CarrierSatelliteInput>,
+        rows: List<DdRow>,
+        baseRange: DoubleArray,
+        sdCarrier: DoubleArray,
+        estimate: FloatEstimate,
+    ): List<AmbiguityState> {
+        val survivingIndices =
+            rows.indices.filter { index ->
+                val row = rows[index]
+                val sat = row.satIndex
+                val ref = row.refIndex
+                val ddGeom =
+                    (distance(estimate.position, inputs[sat].satelliteEcef) - baseRange[sat]) -
+                        (distance(estimate.position, inputs[ref].satelliteEcef) - baseRange[ref])
+                val residualMeters =
+                    abs((sdCarrier[sat] - sdCarrier[ref]) - ddGeom - inputs[sat].wavelengthMeters * estimate.ambiguities[index])
+                val satSigma = inputs[sat].carrierSigmaMeters
+                val refSigma = inputs[ref].carrierSigmaMeters
+                val ddCarrierSigma = sqrt(2.0 * (satSigma * satSigma + refSigma * refSigma))
+                residualMeters <= PRIOR_CARRIER_RESIDUAL_SIGMA * ddCarrierSigma
+            }
+        if (survivingIndices.isEmpty()) return emptyList()
+        val cleanRows = survivingIndices.map { rows[it] }
+        val cleanAmbiguities = DoubleArray(survivingIndices.size) { estimate.ambiguities[survivingIndices[it]] }
+        val cleanCovariance =
+            Array(survivingIndices.size) { i ->
+                DoubleArray(survivingIndices.size) { j ->
+                    estimate.covariance[survivingIndices[i]][survivingIndices[j]]
+                }
+            }
+        return floatStates(inputs, cleanRows, cleanAmbiguities, cleanCovariance)
     }
 
     private fun ambiguityIndex(
@@ -416,7 +723,7 @@ object RtkDoubleDifferenceSolver {
             if (sat.svid == prior.satSvid &&
                 ref.svid == prior.refSvid &&
                 sat.constellationType == prior.constellationType &&
-                abs(sat.wavelengthMeters - prior.wavelengthMeters) < 1e-4
+                abs(sat.wavelengthMeters - prior.wavelengthMeters) < WAVELENGTH_MATCH_TOLERANCE_METERS
             ) {
                 return index
             }
