@@ -168,6 +168,39 @@ class RawGnssPositionFallbackResolverTest {
         assertTrue(attempts.none { it == "GPS:code:HIGH:4" })
     }
 
+    @Test
+    fun resolve_skipsRedundantPppPassWhenNoPppOrSsrStateIsActive() {
+        val gps = gpsMeasurements(count = 5)
+        val expected = sampleResult(latitude = 4.0)
+        val attempts = mutableListOf<String>()
+
+        val result =
+            RawGnssPositionFallbackResolver.resolve(
+                measurements = gps,
+                initialLat = 48.8,
+                initialLon = 2.3,
+                initialAlt = 100.0,
+                gpsTimeNanos = 123L,
+                primaryAccuracy = GnssPositionSolver.Accuracy.HIGH,
+                fallbackConstellationExclusions = intArrayOf(Constellation.GLONASS),
+                positionComputer =
+                    RawGnssPositionComputer { candidateMeasurements, _, _, _, usePpp, _, accuracy ->
+                        attempts += attemptKey(candidateMeasurements, usePpp, accuracy)
+                        if (!usePpp && accuracy == GnssPositionSolver.Accuracy.MEDIUM) expected else null
+                    },
+                hasPppOrSsrState = false,
+            )
+
+        assertSame(expected, result)
+        assertEquals(
+            listOf(
+                "GPS:code:HIGH:5",
+                "GPS:code:MEDIUM:5",
+            ),
+            attempts,
+        )
+    }
+
     private fun gpsMeasurements(count: Int): List<SatelliteMeasurement> =
         constellationMeasurements(
             constellationType = Constellation.GPS,

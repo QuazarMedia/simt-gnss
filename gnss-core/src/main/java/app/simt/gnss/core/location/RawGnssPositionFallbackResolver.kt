@@ -39,6 +39,7 @@ object RawGnssPositionFallbackResolver {
         attemptLogger: ((String) -> Unit)? = null,
         fallbackBudgetMs: Long = DEFAULT_FALLBACK_BUDGET_MS,
         nowNanos: () -> Long = System::nanoTime,
+        hasPppOrSsrState: Boolean = true,
     ): PositionResult? {
         attemptLogger?.invoke(
             "Starting raw GNSS fallback resolution measurements=${measurements.size} constellations=${measurements.constellationSummary()}",
@@ -57,6 +58,7 @@ object RawGnssPositionFallbackResolver {
             positionComputer = positionComputer,
             stageLabel = "full set",
             attemptLogger = attemptLogger,
+            includePpp = hasPppOrSsrState,
         )?.let { return it }
 
         val deadlineNanos = nowNanos() + fallbackBudgetMs * 1_000_000L
@@ -84,6 +86,7 @@ object RawGnssPositionFallbackResolver {
                 positionComputer = positionComputer,
                 stageLabel = "exclude ${constellationToExclude.constellationName()}",
                 attemptLogger = attemptLogger,
+                includePpp = hasPppOrSsrState,
             )?.let { return it }
         }
 

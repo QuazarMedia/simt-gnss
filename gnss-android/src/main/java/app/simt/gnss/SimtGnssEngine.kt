@@ -89,8 +89,11 @@ class SimtGnssEngine(
      * @param usePpp apply SSR corrections from [ssrStore] when available.
      * @param gpsTimeNanos receiver GPS time for the epoch, in nanoseconds.
      * @param accuracy solver accuracy/effort trade-off.
+     * @param commitState when `true` (default), updates session filter state and [diagnostics] on a
+     *   fix; pass `false` to probe candidate subsets without mutating filter or seed state.
      * @return the solution, or `null` when fewer than four usable measurements are available.
      */
+    @JvmOverloads
     fun computePosition(
         measurements: List<SatelliteMeasurement>,
         initialLat: Double = 0.0,
@@ -99,10 +102,39 @@ class SimtGnssEngine(
         usePpp: Boolean = true,
         gpsTimeNanos: Long = 0L,
         accuracy: GnssPositionSolver.Accuracy = GnssPositionSolver.Accuracy.HIGH,
+        commitState: Boolean = true,
     ): PositionResult? =
         processor
-            .computePosition(measurements, initialLat, initialLon, initialAlt, usePpp, gpsTimeNanos, accuracy)
-            .also { if (it != null) lastSolution = it }
+            .computePosition(measurements, initialLat, initialLon, initialAlt, usePpp, gpsTimeNanos, accuracy, commitState)
+            .also { if (it != null && commitState) lastSolution = it }
+
+    /**
+     * Returns `true` when either a fresh PPP seed position or valid SSR corrections exist, so
+     * callers (such as fallback resolvers) can avoid running duplicate `usePpp = true` and
+     * `usePpp = false` solves when both paths are mathematically identical.
+     */
+    @JvmOverloads
+    fun hasActivePppOrSsrState(gpsTimeNanos: Long = 0L): Boolean = processor.hasActivePppOrSsrState(gpsTimeNanos)
+
+    /**
+     * Reset transient session tracking and estimator state (inter-epoch Kalman filter, PPP seed,
+     * carrier/Doppler smoothers, TDCP anchor, RTK ambiguity memory, and RTCM stream buffer) when
+     * starting a new standalone capture session.
+     *
+     * @param preserveEphemeris when `true` (default), keeps decoded/imported broadcast ephemerides,
+     *   CNAV ISC offsets, Klobuchar ionosphere coefficients, and partial nav-frame buffers.
+     * @param clearCorrections when `true` (default), clears [ssrStore], [rtkBaseStore], and SBAS
+     *   fast/long-term corrections (also clearing SBAS PRN masks when [preserveEphemeris] is `false`).
+     */
+    @JvmOverloads
+    fun resetSession(
+        preserveEphemeris: Boolean = true,
+        clearCorrections: Boolean = true,
+    ) {
+        synchronized(rtcmStreamParser) { rtcmStreamParser.reset() }
+        processor.resetSession(preserveEphemeris = preserveEphemeris, clearCorrections = clearCorrections)
+        lastSolution = null
+    }
 
     /**
      * Solve an RTK (relative) position against the base station in [rtkBaseStore].
@@ -134,7 +166,7 @@ class SimtGnssEngine(
      * to [ssrStore] and [rtkBaseStore]; unhandled message types are ignored. Data may be supplied in
      * arbitrary chunks; framing is handled internally.
      */
-    fun ingestRtcmFrame(frame: ByteArray) = rtcmStreamParser.feed(frame)
+    fun ingestRtcmFrame(frame: ByteArray) = synchronized(rtcmStreamParser) { rtcmStreamParser.feed(frame) }
 
     /** Snapshot of the engine's current state for logging or a diagnostics panel. */
     fun diagnostics(): SimtGnssEngineDiagnostics =

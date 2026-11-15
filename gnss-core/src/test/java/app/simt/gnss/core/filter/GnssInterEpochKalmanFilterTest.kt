@@ -360,4 +360,31 @@ class GnssInterEpochKalmanFilterTest {
         assertNotNull(nanCoast)
         assertEquals(gatedCoast.positionCovariance[0][0], nanCoast!!.positionCovariance[0][0], 1e-9)
     }
+
+    @Test
+    fun syncToExternalFix_replacesStaleStateAndVelocity_withoutCoastingNextEpoch() {
+        val rWls = diagR(9.0)
+        val dt = GnssMathUtils.NANOS_PER_SECOND
+        // Seed filter at x = 0 m
+        filter.fuse(Triple(0.0, 0.0, 0.0), rWls, 100L * dt)
+
+        // External fix 200 m away with explicit velocity
+        val rExternal = diagR(0.04)
+        filter.syncToExternalFix(
+            positionEcef = Triple(200.0, 10.0, -5.0),
+            positionCovarianceEcef = rExternal,
+            timeNanos = 101L * dt,
+            velocityEcef = Triple(2.0, 0.0, 0.0),
+            velocityCovarianceEcef = diagR(0.01),
+        )
+        assertNull(filter.coastReport())
+        assertEquals(2.0, filter.velocityEcef().first, 1e-9)
+
+        // Next epoch 1 s later at predicted position (202, 10, -5) must fuse cleanly without tripping 4-sigma gate
+        val out = filter.fuse(Triple(202.0, 10.0, -5.0), rWls, 102L * dt)
+        assertNull("Post-sync epoch near external fix must not coast against old pre-sync state", filter.coastReport())
+        assertEquals(202.0, out.first, 0.5)
+        assertEquals(10.0, out.second, 0.5)
+        assertEquals(-5.0, out.third, 0.5)
+    }
 }

@@ -7,6 +7,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`:gnss-android` / `:gnss-core`** — `SimtGnssEngine.resetSession(preserveEphemeris, clearCorrections)`
+  to reset transient session filter/smoother/TDCP/RTK-ambiguity/RTCM-parser state between
+  capture sessions while optionally preserving broadcast ephemerides and Klobuchar parameters.
+- **`:gnss-android` / `:gnss-core`** — `commitState` parameter on `SimtGnssEngine.computePosition`
+  (default `true`), `SimtGnssEngine.hasActivePppOrSsrState(...)`, and `hasPppOrSsrState` on
+  `RawGnssPositionFallbackResolver.resolve(...)` so fallback callers can probe candidate subsets
+  without mutating session filter state and skip duplicate `usePpp = true` solves when no PPP
+  seed or SSR corrections are active.
+- **`:gnss-core` / `:gnss-android`** — `GnssInterEpochKalmanFilter.syncToExternalFix(...)` and
+  Doppler velocity/bearing output (`speedMetersPerSecond`, `bearingDegrees`) on RTK fixes.
+
+### Fixed
+
+- **`:gnss-core` / `:gnss-android`** — Upgraded the inter-epoch Kalman filter to a 9D
+  delayed-state (`[r_k, v_k, r_{k-1}]`) formulation fusing TDCP displacements and full 3×3
+  Doppler velocity covariance, with per-signal Hatch/Doppler smoother clock-step tracking
+  (`Long` `fullBiasNanos`), Hatch gap resets, and smoothing-aware code sigmas.
+- **`:gnss-android` / `:gnss-core`** — Explicit multi-band ionosphere-free pairing and sigma
+  scaling (preventing E5a+E5b noise amplification), BeiDou `TGD1`/`TGD2` group delays and BDS-3
+  clock-group splitting, single-SV constellation pruning, and cold-start coarse-seed WLS
+  convergence.
+- **`:gnss-android` / `:gnss-core`** — Pilot `STATE_TOW_KNOWN` / `STATE_MSEC_AMBIGUOUS` gating,
+  `GPS_EPOCH_UNIX_SECONDS` fallback conversion, GLONASS L1OF string `tb` frame coherence and
+  `l_n` health checks, and RINEX 3 line-0 `toc` + full-epoch week-age bounds.
+- **`:gnss-core` / `:gnss-android`** — SSR code biases (`1059`/`1065`/`1242`/`1260`), split SSR
+  (`1058`/`1062`/etc.) and IGS `4076` decoding, and BeiDou/GLONASS SSR IOD and polynomial-age
+  handling.
+- **`:gnss-core` / `:gnss-android`** — RTK 50 km baseline cap, differential troposphere and
+  (> 10 km) differential Klobuchar ionosphere, float-covariance ambiguity prior gating and DD
+  reference-pivot transform, MSM lock-time cycle-slip detection, `referenceStationId` coherence,
+  and RTK-to-absolute Kalman/TDCP handover.
+
 ## [0.2.0] - 2026-10-19
 
 ### Added

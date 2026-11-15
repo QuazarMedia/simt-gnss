@@ -60,6 +60,48 @@ class GnssInterEpochKalmanFilter {
     }
 
     /**
+     * Synchronizes the filter state to an external fix (for example an RTK solution) so a
+     * subsequent fallback to absolute positioning predicts from the external position and
+     * velocity instead of fusing against a stale pre-RTK state.
+     */
+    fun syncToExternalFix(
+        positionEcef: Triple<Double, Double, Double>,
+        positionCovarianceEcef: Array<DoubleArray>,
+        timeNanos: Long,
+        velocityEcef: Triple<Double, Double, Double>? = null,
+        velocityCovarianceEcef: Array<DoubleArray>? = null,
+    ) {
+        val (px, py, pz) = positionEcef
+        if (!px.isFinite() || !py.isFinite() || !pz.isFinite()) {
+            reset()
+            return
+        }
+        val rPos =
+            Array(3) { i ->
+                DoubleArray(3) { j -> safePositionCovEntry(positionCovarianceEcef, i, j, isDiagonal = i == j) }
+            }
+        initFromMeasurement(px, py, pz, rPos, timeNanos)
+        coast = null
+        if (velocityEcef != null) {
+            val (vx, vy, vz) = velocityEcef
+            if (vx.isFinite() && vy.isFinite() && vz.isFinite()) {
+                x[3] = vx
+                x[4] = vy
+                x[5] = vz
+                val rVel = velocityCovarianceEcef?.let { sanitizeCovariance3x3(it, minDiag = 1e-6) }
+                if (rVel != null) {
+                    for (i in 0 until 3) {
+                        for (j in 0 until 3) {
+                            p[3 + i][3 + j] = rVel[i][j]
+                        }
+                    }
+                }
+                clipVelocity()
+            }
+        }
+    }
+
+    /**
      * Fuses a new WLS ECEF fix. Returns **filtered** ECEF position (meters).
      *
      * State is 9D `[r_k, v_k, r_{k-1}]` so TDCP relative displacements (`r_k - r_{k-1}`) update
