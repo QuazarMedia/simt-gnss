@@ -5,10 +5,10 @@ targetSdk = "37"
 minSdk = "28"
 
 # Build tools (pinned in lockstep with simt-app so the composite build consumes one toolchain)
-gradle = "9.4.1"
-agp = "9.4.1"
+gradle = "9.5.1"
+agp = "9.5.1"
 kotlin = "2.4.21"
-spotless = "8.10.4"
+spotless = "8.11.0"
 ktlint = "1.2.1"
 
 # Test

@@ -193,8 +193,12 @@ class GnssEphemerisImportTest {
         processor.processNavigationMessage(glonassNavMessage(5, 3, glonassString3()))
         processor.processNavigationMessage(glonassNavMessage(5, 4, glonassString4()))
         val updatedEph = processor.getStoredEphemerisForTest(GnssStatus.CONSTELLATION_GLONASS, 5)!!
+        // Note: if current wall-clock UTC time happens to sit ~12 hours away from 06:00 UTC
+        // (i.e. around 18:15 UTC), tb = 36 (06:00 UTC) and tb = 38 (06:30 UTC) straddle the
+        // ±12 h day-rollover boundary in convertTbToGpsTow, so their time-of-day shift is
+        // always +1800 s modulo 86,400 s.
         val expectedShift = 1800.0
-        val actualShift = (updatedEph.gloTbGpsTow - initialTbTow + GnssMathUtils.SECONDS_IN_WEEK) % GnssMathUtils.SECONDS_IN_WEEK
+        val actualShift = (updatedEph.gloTbGpsTow - initialTbTow).mod(86_400.0)
         assertEquals(expectedShift, actualShift, 1e-6)
     }
 
