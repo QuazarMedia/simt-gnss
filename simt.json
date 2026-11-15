@@ -1,5 +1,5 @@
 {
-  "$comment": "Written and maintained by simt-dev. `simt sync --yes` regenerates the projected rules. `simt init` refreshes the SHA and keeps every key it does not write, so a value you add here survives a re-init. `plans` is such a key: it selects the tracker template and the directories `simt plan` reads. Omit it and the tracker template applies, which reads docs/plans and docs/reviews.",
+  "$comment": "Written and maintained by simt-dev. `simt sync --yes` regenerates the projected rules. `simt init` refreshes the SHA and keeps every key it does not write, so a value you add here survives a re-init. `plans` is such a key: it selects the tracker template and the directories `simt plan` reads. Omit it and the tracker template applies, which reads docs/plans, docs/research and docs/reviews.",
   "id": "simt-gnss",
   "stack": [
     "gradle"
@@ -23,7 +23,7 @@
     "opencode"
   ],
   "projection": {
-    "simtDevSha": "29be4d70e0b1b3025591c241324bcebbfa912240",
-    "version": "0.6.3"
+    "simtDevSha": "cadbf6fb6c388f2f81fedab31b78d4e5e240ead2",
+    "version": "0.9.0"
   }
 }

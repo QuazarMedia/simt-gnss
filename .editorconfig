@@ -1,6 +1,6 @@
 # simt:begin
 # simt:generated
-# simt:sha=29be4d70e0b1b3025591c241324bcebbfa912240
+# simt:sha=cadbf6fb6c388f2f81fedab31b78d4e5e240ead2
 # Generated content. Do not edit by hand - your changes are overwritten.
 # Run `simt sync --yes` to regenerate, or `simt check` to see what is stale.
 
@@ -20,7 +20,7 @@ trim_trailing_whitespace = false
 indent_style = space
 indent_size = 2
 
-[*.{py,pyi,java,kt,kts}]
+[*.{py,pyi,java,kt,kts,rs}]
 indent_size = 4
 
 [{Makefile,*.mk}]
