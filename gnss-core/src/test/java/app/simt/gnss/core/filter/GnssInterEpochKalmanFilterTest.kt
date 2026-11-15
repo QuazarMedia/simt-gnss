@@ -272,16 +272,92 @@ class GnssInterEpochKalmanFilterTest {
     fun displacementMeasurement_pullsPositionToTheCarrierDelta() {
         val r = diagR(25.0)
         filter.fuse(Triple(0.0, 0.0, 0.0), r, 0L)
+        val tdcpCov = diagR(1e-4)
         val out =
             filter.fuse(
-                Triple(0.0, 0.0, 0.0),
+                Triple(1.0, -0.4, 0.2),
                 r,
                 GnssMathUtils.NANOS_PER_SECOND,
-                displacementEcef = Triple(1.0, -0.4, 0.2),
-                displacementVarianceM2 = Triple(1e-4, 1e-4, 1e-4),
+                relativeDisplacementEcef = Triple(1.0, -0.4, 0.2),
+                relativeDisplacementCovarianceM2 = tdcpCov,
             )
-        assertEquals(1.0, out.first, 0.05)
-        assertEquals(-0.4, out.second, 0.05)
-        assertEquals(0.2, out.third, 0.05)
+        assertEquals(1.0, out.first, 1e-3)
+        assertEquals(-0.4, out.second, 1e-3)
+        assertEquals(0.2, out.third, 1e-3)
+        // Covariance must stay on the WLS scale (~12.5 m^2 for 2 averaged epochs), never collapse to 1e-4 m^2.
+        filter.fuse(Triple(10.0, -0.4, 0.2), r, 2 * GnssMathUtils.NANOS_PER_SECOND)
+        assertNull("WLS-scale P_pos must not trip 4-sigma gate on 9 m step", filter.coastReport())
+    }
+
+    @Test
+    fun initialWlsBias_withZeroCarrierDisplacement_convergesToUnbiasedWlsWithoutGating() {
+        // Epoch 0 has a +10 m WLS bias (R = 25 m^2); true motion is 0 m (TDCP Δr = 0, R = 1e-4 m^2);
+        // Epochs 1..15 have unbiased WLS at 0 m (R = 25 m^2). Delayed-state 9D fusion must average
+        // out the initial bias smoothly (< 1.5 m by Epoch 15) without ever tripping the 4-sigma gate.
+        val rWls = diagR(25.0)
+        val rTdcp = diagR(1e-4)
+        val dt = GnssMathUtils.NANOS_PER_SECOND
+        var t = 0L
+        var prevOut = filter.fuse(Triple(10.0, 0.0, 0.0), rWls, t)
+        assertEquals(10.0, prevOut.first, 1e-6)
+        assertNull(filter.coastReport())
+
+        for (epoch in 1..15) {
+            t += dt
+            val out =
+                filter.fuse(
+                    Triple(0.0, 0.0, 0.0),
+                    rWls,
+                    t,
+                    relativeDisplacementEcef = Triple(0.0, 0.0, 0.0),
+                    relativeDisplacementCovarianceM2 = rTdcp,
+                )
+            assertNull("Epoch $epoch must not trip Mahalanobis gate", filter.coastReport())
+            assertTrue(
+                "Epoch $epoch must move monotonically toward 0 (prev=${prevOut.first}, now=${out.first})",
+                out.first <= prevOut.first + 1e-9 && out.first >= 0.0,
+            )
+            prevOut = out
+        }
+        assertTrue("Filtered X after 15 unbiased WLS epochs must be < 1.5 m, was ${prevOut.first}", prevOut.first < 1.5)
+    }
+
+    @Test
+    fun gatedAndNanEpochs_areNotMutatedByRelativeDisplacement() {
+        val rWls = diagR(25.0)
+        val rTdcp = diagR(1e-4)
+        val dt = GnssMathUtils.NANOS_PER_SECOND
+        filter.fuse(Triple(0.0, 0.0, 0.0), rWls, 0L)
+
+        // Gated outlier epoch: coastReport covariance and position must ignore relative displacement.
+        val gatedOut =
+            filter.fuse(
+                Triple(10_000.0, 0.0, 0.0),
+                rWls,
+                dt,
+                relativeDisplacementEcef = Triple(50.0, 0.0, 0.0),
+                relativeDisplacementCovarianceM2 = rTdcp,
+            )
+        assertEquals(0.0, gatedOut.first, 1e-6)
+        val gatedCoast = filter.coastReport()
+        assertNotNull(gatedCoast)
+        assertTrue(
+            "Coasted P_xx must stay at predicted WLS/CV scale (> 25 m^2), was ${gatedCoast!!.positionCovariance[0][0]}",
+            gatedCoast.positionCovariance[0][0] > 25.0,
+        )
+
+        // Non-finite WLS epoch: must also coast without mutating state or applying displacement.
+        val nanOut =
+            filter.fuse(
+                Triple(Double.NaN, 0.0, 0.0),
+                rWls,
+                2 * dt,
+                relativeDisplacementEcef = Triple(50.0, 0.0, 0.0),
+                relativeDisplacementCovarianceM2 = rTdcp,
+            )
+        assertEquals(0.0, nanOut.first, 1e-6)
+        val nanCoast = filter.coastReport()
+        assertNotNull(nanCoast)
+        assertEquals(gatedCoast.positionCovariance[0][0], nanCoast!!.positionCovariance[0][0], 1e-9)
     }
 }

@@ -475,6 +475,113 @@ class HatchFilterTest {
         )
     }
 
+    @Test
+    fun signalDroppingOutAcrossClockRefit_subtractsCumulativeClockStepWithoutBias() {
+        val filter = HatchFilter()
+        val signalA = Triple(Constellation.GPS, 7, 1575)
+        val signalB = Triple(Constellation.GPS, 12, 1575)
+        val rate = -500.0
+        val refitNanos = 334L
+        val refitMeters = refitNanos.toDouble() / GnssMathUtils.NANOS_PER_SECOND * GnssMathUtils.SPEED_OF_LIGHT
+        val fullBias0 = 1_400_000_000_000_000_000L
+        val fullBias1 = fullBias0 + refitNanos
+        val fullBias2 = fullBias1 // 0 m step on Epoch 2
+
+        // Epoch 0: both Signal A and Signal B present
+        filter.beginNewMeasurementsEpoch()
+        filter.smooth(
+            signalA,
+            START_RANGE,
+            ADR_ORIGIN,
+            valid,
+            epoch(0),
+            rate,
+            RATE_SIGMA_MPS,
+            fullBiasNanos = fullBias0,
+        )
+        filter.smooth(
+            signalB,
+            START_RANGE + 1_000.0,
+            ADR_ORIGIN + 500.0,
+            valid,
+            epoch(0),
+            rate,
+            RATE_SIGMA_MPS,
+            fullBiasNanos = fullBias0,
+        )
+
+        // Epoch 1: only Signal A present across 100 m clock refit; Signal B drops out
+        filter.beginNewMeasurementsEpoch()
+        val aEpoch1 =
+            filter.smooth(
+                signalA,
+                START_RANGE + rate - refitMeters,
+                ADR_ORIGIN + rate,
+                valid,
+                epoch(1),
+                rate,
+                RATE_SIGMA_MPS,
+                fullBiasNanos = fullBias1,
+            )
+        assertEquals(START_RANGE + rate - refitMeters, aEpoch1, 1e-6)
+
+        // Epoch 2: Signal B returns with 0 m global step on Epoch 2, but cumulative ~100 m step since Epoch 0
+        filter.beginNewMeasurementsEpoch()
+        val bTruthEpoch2 = START_RANGE + 1_000.0 + 2.0 * rate - refitMeters
+        val bEpoch2 =
+            filter.smooth(
+                signalB,
+                bTruthEpoch2 + BLIP_METERS,
+                ADR_ORIGIN + 500.0 + 2.0 * rate,
+                valid,
+                epoch(2),
+                rate,
+                RATE_SIGMA_MPS,
+                fullBiasNanos = fullBias2,
+            )
+        // With k = 2 and zero cumulative clock bias, output is bTruthEpoch2 + BLIP_METERS / 2.
+        assertEquals(bTruthEpoch2 + BLIP_METERS / 2.0, bEpoch2, 1e-6)
+        assertEquals(2, filter.currentSmoothingCount(signalB))
+    }
+
+    @Test
+    fun signalGapExceedingDopplerMaxDt_resetsSmoothingCountToOne() {
+        val filter = HatchFilter()
+        val rate = -500.0
+        for (t in 0 until 4) {
+            filter.beginNewMeasurementsEpoch()
+            filter.smooth(
+                l1Key,
+                START_RANGE + rate * t,
+                ADR_ORIGIN + rate * t,
+                valid,
+                epoch(t),
+                rate,
+                RATE_SIGMA_MPS,
+                NO_CLOCK_STEP,
+            )
+        }
+        assertEquals(4, filter.currentSmoothingCount(l1Key))
+
+        // 10 s gap (> DOPPLER_MAX_DT_SECONDS = 5 s, < 120 stale epochs) must reset smoothingCount to 1.
+        filter.beginNewMeasurementsEpoch()
+        val gapEpoch = 13
+        val rawAtGap = START_RANGE + rate * gapEpoch + BLIP_METERS
+        val out =
+            filter.smooth(
+                l1Key,
+                rawAtGap,
+                ADR_ORIGIN + rate * gapEpoch,
+                valid,
+                epoch(gapEpoch),
+                rate,
+                RATE_SIGMA_MPS,
+                NO_CLOCK_STEP,
+            )
+        assertEquals(rawAtGap, out, 1e-9)
+        assertEquals(1, filter.currentSmoothingCount(l1Key))
+    }
+
     private fun epoch(index: Int): Long = EPOCH_NANOS * index
 
     /** Deterministic uniform noise in ±[amplitude], so the rms is white-noise rather than an alternation the filter can cancel. */

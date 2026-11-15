@@ -32,6 +32,7 @@ class GnssInterEpochKalmanFilter {
     private val x = DoubleArray(STATE_DIM)
     private val p = Array(STATE_DIM) { DoubleArray(STATE_DIM) }
     private var initialized = false
+    private var hasPreviousEpoch = false
     private var lastTimeNanos: Long = 0L
     private var coast: KalmanCoast? = null
 
@@ -50,6 +51,7 @@ class GnssInterEpochKalmanFilter {
 
     fun reset() {
         initialized = false
+        hasPreviousEpoch = false
         lastTimeNanos = 0L
         consecutiveRejections = 0
         coast = null
@@ -59,6 +61,9 @@ class GnssInterEpochKalmanFilter {
 
     /**
      * Fuses a new WLS ECEF fix. Returns **filtered** ECEF position (meters).
+     *
+     * State is 9D `[r_k, v_k, r_{k-1}]` so TDCP relative displacements (`r_k - r_{k-1}`) update
+     * through `H = [I_3, 0_3, -I_3]` without re-injecting stale anchor bias as an absolute fix.
      *
      * @param wlsEcef unconverged WLS position for this epoch
      * @param rMeasurement 3×3 measurement covariance (m²); typically `σ₀² × covWls[0..2,0..2]`
@@ -70,17 +75,18 @@ class GnssInterEpochKalmanFilter {
         timeNanos: Long,
         velocityEcef: Triple<Double, Double, Double>? = null,
         velocityVarianceM2PerS2: Triple<Double, Double, Double>? = null,
-        displacementEcef: Triple<Double, Double, Double>? = null,
-        displacementVarianceM2: Triple<Double, Double, Double>? = null,
+        velocityCovarianceM2PerS2: Array<DoubleArray>? = null,
+        relativeDisplacementEcef: Triple<Double, Double, Double>? = null,
+        relativeDisplacementCovarianceM2: Array<DoubleArray>? = null,
     ): Triple<Double, Double, Double> {
         val (zx, zy, zz) = wlsEcef
 
         // A non-finite measurement cannot be fused or adopted; coast on the current state
-        // (or report it back unfiltered before initialization).
+        // without mutating P or running predict-less displacement updates.
         if (!zx.isFinite() || !zy.isFinite() || !zz.isFinite()) {
             return if (initialized) {
                 rememberCoast(0.0, 0.0, 0.0)
-                positioned(velocityEcef, velocityVarianceM2PerS2, displacementEcef, displacementVarianceM2)
+                Triple(x[0], x[1], x[2])
             } else {
                 coast = null
                 wlsEcef
@@ -97,7 +103,8 @@ class GnssInterEpochKalmanFilter {
         if (!initialized) {
             initFromMeasurement(zx, zy, zz, r, timeNanos)
             coast = null
-            return positioned(velocityEcef, velocityVarianceM2PerS2, displacementEcef, displacementVarianceM2)
+            applyVelocityMeasurement(velocityEcef, velocityCovarianceM2PerS2, velocityVarianceM2PerS2)
+            return Triple(x[0], x[1], x[2])
         }
 
         val dtSec =
@@ -109,7 +116,8 @@ class GnssInterEpochKalmanFilter {
         ) {
             initFromMeasurement(zx, zy, zz, r, timeNanos)
             coast = null
-            return positioned(velocityEcef, velocityVarianceM2PerS2, displacementEcef, displacementVarianceM2)
+            applyVelocityMeasurement(velocityEcef, velocityCovarianceM2PerS2, velocityVarianceM2PerS2)
+            return Triple(x[0], x[1], x[2])
         }
 
         predict(dtSec)
@@ -129,77 +137,167 @@ class GnssInterEpochKalmanFilter {
                 // Persistent disagreement: the filter state (not the measurements) is wrong.
                 initFromMeasurement(zx, zy, zz, r, timeNanos)
                 coast = null
+                applyVelocityMeasurement(velocityEcef, velocityCovarianceM2PerS2, velocityVarianceM2PerS2)
             } else {
                 // Single/short outlier burst: REJECT it and coast on the prediction. Re-initializing
                 // onto the gated measurement would pass every multipath spike through at full gain
                 // and destroy the converged velocity/covariance state.
-                rememberCoast(y0, y1, y2)
+                applyVelocityMeasurement(velocityEcef, velocityCovarianceM2PerS2, velocityVarianceM2PerS2)
+                rememberCoast(zx - x[0], zy - x[1], zz - x[2])
             }
-            return positioned(velocityEcef, velocityVarianceM2PerS2, displacementEcef, displacementVarianceM2)
+            return Triple(x[0], x[1], x[2])
         }
         consecutiveRejections = 0
         coast = null
 
         updateWithPositionMeasurement(doubleArrayOf(y0, y1, y2), r)
         clipVelocity()
-        return positioned(velocityEcef, velocityVarianceM2PerS2, displacementEcef, displacementVarianceM2)
+        applyVelocityMeasurement(velocityEcef, velocityCovarianceM2PerS2, velocityVarianceM2PerS2)
+        applyRelativeDisplacement(relativeDisplacementEcef, relativeDisplacementCovarianceM2)
+        return Triple(x[0], x[1], x[2])
     }
 
     /** ECEF velocity after the last [fuse]. Zero until a velocity measurement is applied. */
     fun velocityEcef(): Triple<Double, Double, Double> = Triple(x[3], x[4], x[5])
 
-    private fun positioned(
-        velocityEcef: Triple<Double, Double, Double>?,
-        velocityVarianceM2PerS2: Triple<Double, Double, Double>?,
-        displacementEcef: Triple<Double, Double, Double>?,
-        displacementVarianceM2: Triple<Double, Double, Double>?,
-    ): Triple<Double, Double, Double> {
-        applyVelocityMeasurement(velocityEcef, velocityVarianceM2PerS2)
-        applyDisplacementMeasurement(displacementEcef, displacementVarianceM2)
-        return Triple(x[0], x[1], x[2])
-    }
-
-    /** Position measurement of the previous published point plus the carrier displacement. */
-    private fun applyDisplacementMeasurement(
-        positionEcef: Triple<Double, Double, Double>?,
-        variance: Triple<Double, Double, Double>?,
+    private fun applyRelativeDisplacement(
+        deltaEcef: Triple<Double, Double, Double>?,
+        covariance: Array<DoubleArray>?,
     ) {
-        if (positionEcef == null || variance == null || !initialized) return
-        val (px, py, pz) = positionEcef
-        val (varX, varY, varZ) = variance
-        if (!px.isFinite() || !py.isFinite() || !pz.isFinite()) return
-        if (!varX.isFinite() || !varY.isFinite() || !varZ.isFinite()) return
-        if (varX <= 0.0 || varY <= 0.0 || varZ <= 0.0) return
-        val innovation = doubleArrayOf(px - x[0], py - x[1], pz - x[2])
-        val r =
-            arrayOf(
-                doubleArrayOf(varX, 0.0, 0.0),
-                doubleArrayOf(0.0, varY, 0.0),
-                doubleArrayOf(0.0, 0.0, varZ),
+        if (deltaEcef == null || covariance == null || !initialized || !hasPreviousEpoch) return
+        val (dx, dy, dz) = deltaEcef
+        if (!dx.isFinite() || !dy.isFinite() || !dz.isFinite()) return
+        val r = sanitizeCovariance3x3(covariance, minDiag = 1e-4) ?: return
+
+        val innovation =
+            doubleArrayOf(
+                dx - (x[0] - x[6]),
+                dy - (x[1] - x[7]),
+                dz - (x[2] - x[8]),
             )
-        updateLinear(innovation, r, stateOffset = 0)
+
+        // H = [I_3, 0_3, -I_3] => H P H^T = P_00 + P_66 - P_06 - P_60
+        val s =
+            Array(3) { i ->
+                DoubleArray(3) { j ->
+                    (p[i][j] + p[6 + i][6 + j] - p[i][6 + j] - p[6 + i][j] + r[i][j]).coerceFinite()
+                }
+            }
+        val sInv = invert3x3(s) ?: return
+
+        val pHt =
+            Array(STATE_DIM) { i ->
+                DoubleArray(3) { m ->
+                    p[i][m] - p[i][6 + m]
+                }
+            }
+        val k = Array(STATE_DIM) { DoubleArray(3) }
+        for (i in 0 until STATE_DIM) {
+            for (j in 0 until 3) {
+                var sum = 0.0
+                for (m in 0 until 3) {
+                    sum += pHt[i][m] * sInv[m][j]
+                }
+                k[i][j] = sum
+            }
+        }
+
+        for (i in 0 until STATE_DIM) {
+            for (j in 0 until 3) {
+                x[i] += k[i][j] * innovation[j]
+            }
+        }
+
+        // Joseph form: P = (I - K H) P (I - K H)^T + K R K^T
+        val iMinusKh = Array(STATE_DIM) { DoubleArray(STATE_DIM) }
+        for (i in 0 until STATE_DIM) {
+            for (j in 0 until STATE_DIM) {
+                val khEntry =
+                    when (j) {
+                        in 0..2 -> k[i][j]
+                        in 6..8 -> -k[i][j - 6]
+                        else -> 0.0
+                    }
+                iMinusKh[i][j] = (if (i == j) 1.0 else 0.0) - khEntry
+            }
+        }
+
+        val p1 = matMul9(iMinusKh, p)
+        val p2 = matMul9(p1, transpose9(iMinusKh))
+        val krKt = Array(STATE_DIM) { DoubleArray(STATE_DIM) }
+        for (i in 0 until STATE_DIM) {
+            for (j in 0 until STATE_DIM) {
+                var sum = 0.0
+                for (a in 0 until 3) {
+                    for (b in 0 until 3) {
+                        sum += k[i][a] * r[a][b] * k[j][b]
+                    }
+                }
+                krKt[i][j] = sum
+            }
+        }
+        for (i in 0 until STATE_DIM) {
+            for (j in 0 until STATE_DIM) {
+                p[i][j] = p2[i][j] + krKt[i][j]
+            }
+        }
+        symmetrize9(p)
         clipVelocity()
     }
 
     private fun applyVelocityMeasurement(
         velocityEcef: Triple<Double, Double, Double>?,
+        covariance: Array<DoubleArray>?,
         variance: Triple<Double, Double, Double>?,
     ) {
-        if (velocityEcef == null || variance == null || !initialized) return
+        if (velocityEcef == null || !initialized) return
         val (vx, vy, vz) = velocityEcef
-        val (varX, varY, varZ) = variance
         if (!vx.isFinite() || !vy.isFinite() || !vz.isFinite()) return
-        if (!varX.isFinite() || !varY.isFinite() || !varZ.isFinite()) return
-        if (varX <= 0.0 || varY <= 0.0 || varZ <= 0.0) return
-        val innovation = doubleArrayOf(vx - x[3], vy - x[4], vz - x[5])
         val r =
-            arrayOf(
-                doubleArrayOf(varX, 0.0, 0.0),
-                doubleArrayOf(0.0, varY, 0.0),
-                doubleArrayOf(0.0, 0.0, varZ),
-            )
+            if (covariance != null) {
+                sanitizeCovariance3x3(covariance, minDiag = 1e-6) ?: return
+            } else if (variance != null) {
+                val (varX, varY, varZ) = variance
+                if (!varX.isFinite() || !varY.isFinite() || !varZ.isFinite()) return
+                if (varX <= 0.0 || varY <= 0.0 || varZ <= 0.0) return
+                arrayOf(
+                    doubleArrayOf(varX, 0.0, 0.0),
+                    doubleArrayOf(0.0, varY, 0.0),
+                    doubleArrayOf(0.0, 0.0, varZ),
+                )
+            } else {
+                return
+            }
+        val innovation = doubleArrayOf(vx - x[3], vy - x[4], vz - x[5])
         updateLinear(innovation, r, stateOffset = 3)
         clipVelocity()
+    }
+
+    private fun sanitizeCovariance3x3(
+        covariance: Array<DoubleArray>,
+        minDiag: Double,
+    ): Array<DoubleArray>? {
+        if (covariance.size < 3 || covariance[0].size < 3 || covariance[1].size < 3 || covariance[2].size < 3) {
+            return null
+        }
+        val result = Array(3) { DoubleArray(3) }
+        for (i in 0 until 3) {
+            val diag = covariance[i][i]
+            if (!diag.isFinite() || diag <= 0.0) return null
+            result[i][i] = diag.coerceIn(minDiag, 1e6)
+        }
+        for (i in 0 until 3) {
+            for (j in i + 1 until 3) {
+                val v1 = covariance[i][j]
+                val v2 = covariance[j][i]
+                if (!v1.isFinite() || !v2.isFinite()) return null
+                val maxAbs = sqrt(result[i][i] * result[j][j])
+                val avg = (0.5 * (v1 + v2)).coerceIn(-maxAbs, maxAbs)
+                result[i][j] = avg
+                result[j][i] = avg
+            }
+        }
+        return result
     }
 
     private fun rememberCoast(
@@ -229,6 +327,9 @@ class GnssInterEpochKalmanFilter {
         x[3] = 0.0
         x[4] = 0.0
         x[5] = 0.0
+        x[6] = zx
+        x[7] = zy
+        x[8] = zz
         for (i in 0 until STATE_DIM) {
             for (j in 0 until STATE_DIM) {
                 p[i][j] = 0.0
@@ -236,7 +337,9 @@ class GnssInterEpochKalmanFilter {
         }
         for (i in 0 until 3) {
             for (j in 0 until 3) {
-                p[i][j] = safePositionCovEntry(rMeasurement, i, j, isDiagonal = i == j)
+                val entry = safePositionCovEntry(rMeasurement, i, j, isDiagonal = i == j)
+                p[i][j] = entry
+                p[6 + i][6 + j] = entry
             }
         }
         val v0 = GnssMathUtils.KALMAN_INITIAL_VEL_VAR_M2_S2
@@ -245,6 +348,7 @@ class GnssInterEpochKalmanFilter {
         p[5][5] = v0
         lastTimeNanos = timeNanos
         initialized = true
+        hasPreviousEpoch = false
         consecutiveRejections = 0
     }
 
@@ -261,24 +365,28 @@ class GnssInterEpochKalmanFilter {
     }
 
     private fun predict(dt: Double) {
-        // x := F x
-        val rx = x[0] + x[3] * dt
-        val ry = x[1] + x[4] * dt
-        val rz = x[2] + x[5] * dt
-        x[0] = rx
-        x[1] = ry
-        x[2] = rz
+        // Preserve pre-predict position in x[6..8] so TDCP relates r_k to r_{k-1} with exact Cov(r_k, r_{k-1}).
+        val prevRx = x[0]
+        val prevRy = x[1]
+        val prevRz = x[2]
+        x[0] = prevRx + x[3] * dt
+        x[1] = prevRy + x[4] * dt
+        x[2] = prevRz + x[5] * dt
+        x[6] = prevRx
+        x[7] = prevRy
+        x[8] = prevRz
 
-        val f = buildF(dt)
-        val fp = matMul6(f, p)
-        val fpFt = matMul6(fp, transpose6(f))
-        val q = buildProcessNoiseQ(dt, accelNoiseDensity)
+        val f = buildF9(dt)
+        val fp = matMul9(f, p)
+        val fpFt = matMul9(fp, transpose9(f))
+        val q = buildProcessNoiseQ9(dt, accelNoiseDensity)
         for (i in 0 until STATE_DIM) {
             for (j in 0 until STATE_DIM) {
                 p[i][j] = fpFt[i][j] + q[i][j]
             }
         }
-        symmetrize6(p)
+        symmetrize9(p)
+        hasPreviousEpoch = true
     }
 
     private fun updateWithPositionMeasurement(
@@ -331,8 +439,8 @@ class GnssInterEpochKalmanFilter {
             }
         }
 
-        val p1 = matMul6(iMinusKh, p)
-        val p2 = matMul6(p1, transpose6(iMinusKh))
+        val p1 = matMul9(iMinusKh, p)
+        val p2 = matMul9(p1, transpose9(iMinusKh))
 
         val krKt = Array(STATE_DIM) { DoubleArray(STATE_DIM) }
         for (i in 0 until STATE_DIM) {
@@ -351,7 +459,7 @@ class GnssInterEpochKalmanFilter {
                 p[i][j] = p2[i][j] + krKt[i][j]
             }
         }
-        symmetrize6(p)
+        symmetrize9(p)
     }
 
     private fun clipVelocity() {
@@ -365,17 +473,16 @@ class GnssInterEpochKalmanFilter {
             x[3] *= s
             x[4] *= s
             x[5] *= s
-            // Scaling velocity by s means Var(v') = s² Var(v), Cov(r,v') = s Cov(r,v).
-            // Previous implementation used a single `s` factor for both blocks, under-inflating
-            // the velocity variance and stranding the filter at a pessimistic covariance.
+            // Scale only the velocity block (indices 3..5) across all 9 rows/cols;
+            // scaling >= 3 would corrupt delayed position covariances at 6..8.
             for (i in 0 until STATE_DIM) {
                 for (j in 0 until STATE_DIM) {
-                    val si = if (i >= 3) s else 1.0
-                    val sj = if (j >= 3) s else 1.0
+                    val si = if (i in 3..5) s else 1.0
+                    val sj = if (j in 3..5) s else 1.0
                     p[i][j] *= si * sj
                 }
             }
-            symmetrize6(p)
+            symmetrize9(p)
         }
     }
 
@@ -398,41 +505,42 @@ class GnssInterEpochKalmanFilter {
     }
 
     private companion object {
-        const val STATE_DIM = 6
+        const val STATE_DIM = 9
     }
 }
 
 private fun Double.coerceFinite(): Double = if (isFinite()) this else 1.0
 
-private fun buildF(dt: Double): Array<DoubleArray> {
-    val f = Array(6) { DoubleArray(6) { 0.0 } }
+private fun buildF9(dt: Double): Array<DoubleArray> {
+    val f = Array(9) { DoubleArray(9) { 0.0 } }
     for (i in 0 until 3) {
         f[i][i] = 1.0
         f[i][i + 3] = dt
         f[i + 3][i + 3] = 1.0
+        f[i + 6][i] = 1.0
     }
     return f
 }
 
-private fun transpose6(a: Array<DoubleArray>): Array<DoubleArray> {
-    val t = Array(6) { DoubleArray(6) }
-    for (i in 0 until 6) {
-        for (j in 0 until 6) {
+private fun transpose9(a: Array<DoubleArray>): Array<DoubleArray> {
+    val t = Array(9) { DoubleArray(9) }
+    for (i in 0 until 9) {
+        for (j in 0 until 9) {
             t[i][j] = a[j][i]
         }
     }
     return t
 }
 
-private fun matMul6(
+private fun matMul9(
     a: Array<DoubleArray>,
     b: Array<DoubleArray>,
 ): Array<DoubleArray> {
-    val c = Array(6) { DoubleArray(6) }
-    for (i in 0 until 6) {
-        for (j in 0 until 6) {
+    val c = Array(9) { DoubleArray(9) }
+    for (i in 0 until 9) {
+        for (j in 0 until 9) {
             var sum = 0.0
-            for (k in 0 until 6) {
+            for (k in 0 until 9) {
                 sum += a[i][k] * b[k][j]
             }
             c[i][j] = sum
@@ -441,12 +549,12 @@ private fun matMul6(
     return c
 }
 
-/** Continuous white acceleration per axis → discrete Q (6×6) for CV model, axes (r,v) interleaved by component. */
-private fun buildProcessNoiseQ(
+/** Continuous white acceleration per axis → discrete Q (9×9) for CV model on [r_k, v_k]; r_{k-1} is noiseless copy. */
+private fun buildProcessNoiseQ9(
     dt: Double,
     qa: Double,
 ): Array<DoubleArray> {
-    val q = Array(6) { DoubleArray(6) }
+    val q = Array(9) { DoubleArray(9) }
     val dt2 = dt * dt
     val dt3 = dt2 * dt
     val q11 = qa * dt3 / 3.0
@@ -463,9 +571,9 @@ private fun buildProcessNoiseQ(
     return q
 }
 
-private fun symmetrize6(p: Array<DoubleArray>) {
-    for (i in 0 until 6) {
-        for (j in i + 1 until 6) {
+private fun symmetrize9(p: Array<DoubleArray>) {
+    for (i in 0 until 9) {
+        for (j in i + 1 until 9) {
             val v = 0.5 * (p[i][j] + p[j][i])
             p[i][j] = v
             p[j][i] = v

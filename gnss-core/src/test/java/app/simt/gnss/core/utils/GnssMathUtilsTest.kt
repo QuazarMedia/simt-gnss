@@ -236,6 +236,23 @@ class GnssMathUtilsTest {
     }
 
     @Test
+    fun pseudorangeSigma_scalesWithSmoothingEpochsFromUnsmoothedToConverged() {
+        val converged = GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(45.0, GnssMathUtils.CN0_REFERENCE_DB_HZ)
+        val explicitConverged =
+            GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(
+                45.0,
+                GnssMathUtils.CN0_REFERENCE_DB_HZ,
+                GnssMathUtils.HATCH_FILTER_MAX_SMOOTHING.toInt(),
+            )
+        val unsmoothed = GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(45.0, GnssMathUtils.CN0_REFERENCE_DB_HZ, 1)
+        val partial = GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(45.0, GnssMathUtils.CN0_REFERENCE_DB_HZ, 15)
+
+        assertEquals(converged, explicitConverged, 1e-12)
+        assertEquals(converged * 4.0, unsmoothed, 1e-9)
+        assertTrue(partial > converged && partial < unsmoothed)
+    }
+
+    @Test
     fun raimStandardizedThreshold_isFourSigma() {
         // The normalized-residual RAIM test must stay at 4σ (guards against accidental relaxation).
         assertEquals(4.0, GnssMathUtils.RAIM_STANDARDIZED_RESIDUAL_SIGMA, 1e-12)

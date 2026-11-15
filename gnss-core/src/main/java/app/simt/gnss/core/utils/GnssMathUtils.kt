@@ -192,6 +192,13 @@ object GnssMathUtils {
     const val PHASE_VARIANCE_M2 = 1e-4 // (0.01m)^2 = 1 cm phase noise variance
 
     /**
+     * Variance multiplier on an unsmoothed (`k = 1`) smartphone code epoch relative to the
+     * carrier-smoothed floor (`16.0` => `4×` sigma at `k = 1`, tapering as `1/√k` to `1.0×` at
+     * [HATCH_FILTER_MAX_SMOOTHING]).
+     */
+    const val UNSMOOTHED_CODE_VARIANCE_FACTOR = 16.0
+
+    /**
      * Hatch smoothing window cap (epochs ≈ seconds at 1 Hz). Single-frequency code and
      * carrier diverge at twice the iono rate, so the classic guidance caps near 100 s —
      * the previous 200 accumulated a ~4-8 m steady-state bias under ordinary daytime
@@ -352,9 +359,11 @@ object GnssMathUtils {
      * The floor applied by callers should be `max(androidReportedSigma, this)` so Android's
      * time-tagging uncertainty never inflates weights below the physical code-noise limit.
      */
+    @JvmOverloads
     fun pseudorangeSigmaFromElevationAndCn0(
         elevationDegrees: Double,
         cn0DbHz: Double,
+        smoothingEpochs: Int = HATCH_FILTER_MAX_SMOOTHING.toInt(),
     ): Double {
         val el = elevationDegrees.coerceIn(0.1, 90.0)
         val sinEl = sin(Math.toRadians(el)).coerceAtLeast(1e-3)
@@ -363,7 +372,15 @@ object GnssMathUtils {
         val baseVar = a * a + (b * b) / (sinEl * sinEl)
         // C/N₀ scaling: 10 dB higher C/N₀ = ×0.1 variance = /√10 sigma; 10 dB lower = ×10 variance.
         val cn0Scale = 10.0.pow(-(cn0DbHz - CN0_REFERENCE_DB_HZ) / 10.0)
-        return sqrt(baseVar * cn0Scale)
+        val maxSmoothing = HATCH_FILTER_MAX_SMOOTHING.toInt()
+        val smoothingScale =
+            if (smoothingEpochs < maxSmoothing) {
+                val k = smoothingEpochs.coerceIn(1, maxSmoothing).toDouble()
+                sqrt(1.0 + (UNSMOOTHED_CODE_VARIANCE_FACTOR - 1.0) / k)
+            } else {
+                1.0
+            }
+        return sqrt(baseVar * cn0Scale) * smoothingScale
     }
 
     /**
