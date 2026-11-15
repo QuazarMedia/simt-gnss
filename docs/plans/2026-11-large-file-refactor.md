@@ -23,7 +23,7 @@ gating-logic changes (review-hardened code).
 |----|------|---------|-------|-------|----------|
 | r1 | processor-split | - | Split `GnssMeasurementProcessor.kt` (3,851 lines) into cohesive internal files | Complete | d480115dd6d209338131b7078ea70defab43ee3c |
 | r2 | rtk-split | r1 | Split `RtkDoubleDifferenceSolver.kt` (1,062 lines) into cohesive files | Complete | 2260fb105531383b8f978de31eaf27a230526e7d |
-| r3 | test-split | r1 | Split `GnssMeasurementProcessorTest.kt` (2,506 lines) into per-area test files | Queued | |
+| r3 | test-split | r1 | Split `GnssMeasurementProcessorTest.kt` (2,506 lines) into per-area test files | Complete | 499b0ca36a5fca0893224aa9dac8cb01a2777ac9 |
 
 Slice ids are letter-prefixed (`r1`…) so they do not collide with the completed
 remediation plan's `1`–`6` in `simt slice start`. Companion single slice in
