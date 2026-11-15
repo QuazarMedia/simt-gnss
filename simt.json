@@ -23,7 +23,7 @@
     "opencode"
   ],
   "projection": {
-    "simtDevSha": "cadbf6fb6c388f2f81fedab31b78d4e5e240ead2",
-    "version": "0.9.0"
+    "simtDevSha": "1c8436ac0ee4ea8fa7f6387b32683fc98adbbd03",
+    "version": "0.10.0"
   }
 }
