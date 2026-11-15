@@ -159,9 +159,11 @@ object BeidouNavMessageParser {
             val week = getBits(sf1, 60, 13)
             val toc = u2(sf1, 73, 9, 90, 8) * 8.0
             val tgd1 = s1(sf1, 98, 10) * 0.1 * 1e-9
+            val tgd2 = s2(sf1, 108, 4, 120, 6) * 0.1 * 1e-9
             val af2 = s1(sf1, 214, 11) * 2.0.pow(-66)
             val af0 = s2(sf1, 225, 7, 240, 17) * 2.0.pow(-33)
             val af1 = s2(sf1, 257, 5, 270, 17) * 2.0.pow(-50)
+            val aode = getBits(sf1, 287, 5)
 
             // --- Subframe 2: ΔN, Cuc, M0, e, Cus, Crc, Crs, √A, toe MSBs ---
             val deltaN = s2(sf2, 42, 10, 60, 6) * 2.0.pow(-43) * PI
@@ -194,6 +196,7 @@ object BeidouNavMessageParser {
                 constellationType = Constellation.BEIDOU,
                 svid = svid,
                 week = week,
+                iode = aode,
                 toe = toe,
                 toc = toc,
                 af0 = af0,
@@ -215,6 +218,7 @@ object BeidouNavMessageParser {
                 cic = cic,
                 cis = cis,
                 tgd = tgd1,
+                beidouTgd2Seconds = tgd2,
                 lastUpdateTime = GnssPlatform.timeSource.elapsedRealtimeMs(),
             )
         } catch (e: Exception) {

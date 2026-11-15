@@ -100,6 +100,8 @@ class BeidouNavMessageParserTest {
     private val sow1 = 345_600L
     private val tocRaw = 43_200L // ×8 = 345,600 s
     private val tgd1Raw = -34L // ×0.1 ns
+    private val tgd2Raw = 47L // ×0.1 ns, split 4 MSBs in W4 + 6 LSBs in W5
+    private val aodeRaw = 1L
     private val af2Raw = -3L
     private val af0Raw = -123_457L
     private val af1Raw = 8_123L
@@ -133,6 +135,7 @@ class BeidouNavMessageParserTest {
     private fun buildSf1Info(
         satH1: Long = 0L,
         sow: Long = sow1,
+        tgd2: Long = tgd2Raw,
     ): ByteArray =
         ByteArray(38).also { b ->
             infoHeader(b, 1, sow)
@@ -142,10 +145,11 @@ class BeidouNavMessageParserTest {
             putSplit(b, week, 60 to 13)
             putSplit(b, tocRaw, 73 to 9, 90 to 8)
             putSplit(b, tgd1Raw, 98 to 10)
+            putSplit(b, tgd2, 108 to 4, 120 to 6)
             putSplit(b, af2Raw, 214 to 11)
             putSplit(b, af0Raw, 225 to 7, 240 to 17)
             putSplit(b, af1Raw, 257 to 5, 270 to 17)
-            putSplit(b, 1L, 287 to 5) // AODE
+            putSplit(b, aodeRaw, 287 to 5) // AODE
         }
 
     private fun buildSf2Info(sow: Long = sow1 + 6): ByteArray =
@@ -181,6 +185,8 @@ class BeidouNavMessageParserTest {
         assertScaled(tocRaw * 8.0, eph.toc)
         assertScaled(toeRaw * 8.0, eph.toe)
         assertScaled(tgd1Raw * 0.1 * 1e-9, eph.tgd)
+        assertScaled(tgd2Raw * 0.1 * 1e-9, eph.beidouTgd2Seconds)
+        assertEquals(aodeRaw.toInt(), eph.iode)
         assertScaled(af2Raw * 2.0.pow(-66), eph.af2)
         assertScaled(af0Raw * 2.0.pow(-33), eph.af0)
         assertScaled(af1Raw * 2.0.pow(-50), eph.af1)
@@ -286,5 +292,30 @@ class BeidouNavMessageParserTest {
         // Zero words pass BCH trivially but produce a non-physical orbit (sqrtA = 0)
         // and FraID 0 — must not yield an ephemeris.
         assertNull(BeidouNavMessageParser.parseBeidouEphemeris(6, ByteArray(38), ByteArray(38), ByteArray(38)))
+    }
+
+    @Test
+    fun parse_negativeAndPositiveTgd2_decodesSplitTwosComplement() {
+        val negRaw = -83L
+        val ephNeg =
+            BeidouNavMessageParser.parseBeidouEphemeris(
+                svid = 6,
+                sf1Raw = encodeInterleaved(buildSf1Info(tgd2 = negRaw)),
+                sf2Raw = encodeInterleaved(buildSf2Info()),
+                sf3Raw = encodeInterleaved(buildSf3Info()),
+            )
+        val nonNullNeg = requireNotNull(ephNeg)
+        assertScaled(negRaw * 0.1 * 1e-9, nonNullNeg.beidouTgd2Seconds)
+
+        val posRaw = 125L
+        val ephPos =
+            BeidouNavMessageParser.parseBeidouEphemeris(
+                svid = 6,
+                sf1Raw = encodeDeinterleaved(buildSf1Info(tgd2 = posRaw)),
+                sf2Raw = encodeDeinterleaved(buildSf2Info()),
+                sf3Raw = encodeDeinterleaved(buildSf3Info()),
+            )
+        val nonNullPos = requireNotNull(ephPos)
+        assertScaled(posRaw * 0.1 * 1e-9, nonNullPos.beidouTgd2Seconds)
     }
 }

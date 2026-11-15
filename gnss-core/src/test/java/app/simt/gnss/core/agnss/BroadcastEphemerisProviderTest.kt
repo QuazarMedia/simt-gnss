@@ -262,4 +262,28 @@ class BroadcastEphemerisProviderTest {
 
         assertEquals(0, BroadcastEphemerisProvider.parseRinex3MixedNav(truncated, now).size)
     }
+
+    @Test
+    fun beidouRecord_decodesTgd1AndTgd2_andClampsSentinels() {
+        val now = 345_600.0
+        val toe = now - 600.0
+        val bdsPos = keplerRecord('C', 6, toe, now, line5Field2 = 0.0, health = 0.0, bgdE1E5a = 1.2e-8, bgdE1E5b = 2.5e-8)
+        val bdsNeg = keplerRecord('C', 7, toe, now, line5Field2 = 0.0, health = 0.0, bgdE1E5a = -9.5e-9, bgdE1E5b = -4.2e-9)
+        val bdsSentinel = keplerRecord('C', 8, toe, now, line5Field2 = 0.0, health = 0.0, bgdE1E5a = 0.9999e9, bgdE1E5b = -0.9999e9)
+
+        val records = BroadcastEphemerisProvider.parseRinex3MixedNav(rinex(bdsPos + bdsNeg + bdsSentinel), now)
+        assertEquals(3, records.size)
+
+        val pos = records.first { it.svid == 6 }
+        assertEquals(1.2e-8, pos.tgd, 1e-18)
+        assertEquals(2.5e-8, pos.beidouTgd2Seconds, 1e-18)
+
+        val neg = records.first { it.svid == 7 }
+        assertEquals(-9.5e-9, neg.tgd, 1e-18)
+        assertEquals(-4.2e-9, neg.beidouTgd2Seconds, 1e-18)
+
+        val sentinel = records.first { it.svid == 8 }
+        assertEquals(0.0, sentinel.tgd, 0.0)
+        assertEquals(0.0, sentinel.beidouTgd2Seconds, 0.0)
+    }
 }

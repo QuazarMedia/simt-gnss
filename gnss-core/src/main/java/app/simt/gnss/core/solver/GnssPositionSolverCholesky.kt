@@ -21,6 +21,8 @@ internal object GnssPositionSolverCholesky {
         if (n == 0) return null
         val m = A[0].size
         if (m == 0 || b.size != n || w.size != n) return null
+        val validRows = w.count { it.isFinite() && it > 0.0 }
+        if (n < m || validRows < m) return null
 
         val atwa = Array(m) { DoubleArray(m) }
         for (i in 0 until m) {
