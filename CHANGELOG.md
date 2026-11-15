@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-15
+
+Six-slice remediation program for engine accuracy and fix reliability (see
+`docs/plans/2026-11-gnss-engine-accuracy-remediation.md`), plus AGP/Spotless version
+alignment.
+
 ### Added
 
 - **`:gnss-android` / `:gnss-core`** — `SimtGnssEngine.resetSession(preserveEphemeris, clearCorrections)`
@@ -90,5 +96,6 @@ First public release.
 - CI: a build/test workflow and a tag-driven Maven Central release workflow that creates the
   matching GitHub release once the upload succeeds.
 
-[Unreleased]: https://github.com/QuazarMedia/simt-gnss/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/QuazarMedia/simt-gnss/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/QuazarMedia/simt-gnss/releases/tag/v0.3.0
 [0.1.0]: https://github.com/QuazarMedia/simt-gnss/releases/tag/v0.1.0
