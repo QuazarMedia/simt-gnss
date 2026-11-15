@@ -151,9 +151,16 @@ object SsrCorrectionApplicator {
      * Age of an SSR rate polynomial. The rates are referenced to epoch + ½ update interval
      * (RTKLIB `t1 -= udi/2`). An unknown interval (0) leaves the age at t − epoch.
      */
+    @JvmOverloads
     fun ssrPolynomialAgeSeconds(
         gpsSeconds: Double,
         epochTime: Double,
         updateIntervalSeconds: Double,
-    ): Double = GnssMathUtils.wrapToHalfWeekSeconds(gpsSeconds - epochTime) - updateIntervalSeconds / 2.0
+        periodSeconds: Double = GnssMathUtils.SECONDS_IN_WEEK,
+    ): Double {
+        val halfPeriod = periodSeconds / 2.0
+        var dt = (gpsSeconds - epochTime).mod(periodSeconds)
+        if (dt > halfPeriod) dt -= periodSeconds
+        return dt - updateIntervalSeconds / 2.0
+    }
 }

@@ -1486,10 +1486,16 @@ internal class GnssMeasurementProcessor(
             // IF-combined SVs whose satellite clock must EXCLUDE the broadcast group delay
             // (LNAV/BGD path: the per-signal biases cancel in the IF combination).
             val ifClockWithoutGroupDelaySatKeys = mutableSetOf<Pair<Int, Int>>()
+            val ssrCodeBiasAppliedSatKeys = mutableSetOf<Pair<Int, Int>>()
             val ifPairComponentsBySat = HashMap<Pair<Int, Int>, IfPairComponents>()
 
             // Initial filtering and IF combination
             for ((satKey, svMeasurements) in groupedBySv) {
+                val ephemerisForSv = usableEphemerisBySat[satKey]
+                val ssrPairForSv =
+                    ephemerisForSv?.let {
+                        getApplicableSsrPair(satKey.first, satKey.second, it, usePpp)
+                    }
                 val upperCandidates =
                     svMeasurements
                         .filter { m ->
@@ -1531,21 +1537,43 @@ internal class GnssMeasurementProcessor(
                     val (upper, lower) = selectedPair
                     val f1 = upper.carrierFrequencyHz
                     val f2 = lower.carrierFrequencyHz
-                    val ephemerisForIf = usableEphemerisBySat[satKey]
 
-                    val ifAdjustment =
-                        codePseudorangesForIonosphereFreeMeters(
-                            satKey = satKey,
-                            l1Meters = upper.pseudorangeMeters,
-                            l5Meters = lower.pseudorangeMeters,
-                            ephemeris = ephemerisForIf,
-                            upperBandHz = f1,
-                            lowerBandHz = f2,
-                        )
-                    val l1CodeForIf = ifAdjustment.l1Meters
-                    val l5CodeForIf = ifAdjustment.l5Meters
-                    if (!ifAdjustment.clockIncludesGroupDelay) {
+                    val bHigh =
+                        if (ssrPairForSv != null) {
+                            ssrStore.getCodeBiasForBand(satKey.first, satKey.second, effectiveSignalBand(upper))
+                        } else {
+                            null
+                        }
+                    val bLow =
+                        if (ssrPairForSv != null) {
+                            ssrStore.getCodeBiasForBand(satKey.first, satKey.second, effectiveSignalBand(lower))
+                        } else {
+                            null
+                        }
+
+                    val l1CodeForIf: Double
+                    val l5CodeForIf: Double
+                    if (bHigh != null && bLow != null) {
+                        // RTCM 10403.3 §3.5.12.3 (DF383): PR_corr = PR_measured + CodeBias
+                        l1CodeForIf = upper.pseudorangeMeters + bHigh.bias
+                        l5CodeForIf = lower.pseudorangeMeters + bLow.bias
                         ifClockWithoutGroupDelaySatKeys.add(satKey)
+                        ssrCodeBiasAppliedSatKeys.add(satKey)
+                    } else {
+                        val ifAdjustment =
+                            codePseudorangesForIonosphereFreeMeters(
+                                satKey = satKey,
+                                l1Meters = upper.pseudorangeMeters,
+                                l5Meters = lower.pseudorangeMeters,
+                                ephemeris = ephemerisForSv,
+                                upperBandHz = f1,
+                                lowerBandHz = f2,
+                            )
+                        l1CodeForIf = ifAdjustment.l1Meters
+                        l5CodeForIf = ifAdjustment.l5Meters
+                        if (!ifAdjustment.clockIncludesGroupDelay) {
+                            ifClockWithoutGroupDelaySatKeys.add(satKey)
+                        }
                     }
 
                     // Pseudorange IF Combination
@@ -1587,7 +1615,19 @@ internal class GnssMeasurementProcessor(
                     )
                     ifCorrectedSatKeys.add(satKey)
                 } else {
-                    activeMeasurements.add(upperCandidates.firstOrNull() ?: lowerCandidates.firstOrNull() ?: svMeasurements.first())
+                    val singleMeas = upperCandidates.firstOrNull() ?: lowerCandidates.firstOrNull() ?: svMeasurements.first()
+                    val bSingle =
+                        if (ssrPairForSv != null) {
+                            ssrStore.getCodeBiasForBand(satKey.first, satKey.second, effectiveSignalBand(singleMeas))
+                        } else {
+                            null
+                        }
+                    if (bSingle != null) {
+                        ssrCodeBiasAppliedSatKeys.add(satKey)
+                        activeMeasurements.add(singleMeas.copy(pseudorangeMeters = singleMeas.pseudorangeMeters + bSingle.bias))
+                    } else {
+                        activeMeasurements.add(singleMeas)
+                    }
                 }
             }
 
@@ -1664,7 +1704,7 @@ internal class GnssMeasurementProcessor(
 
                 // Handle multi-constellation clock biases (ISB), splitting BeiDou B3I-calibrated vs
                 // uncalibrated BDS-3 (B1C/B2a) into two clock groups when both sub-groups have >= 2 SVs.
-                val clockGroupBySatKey = buildClockGroupBySatKey(activeMeasurements, ifPairComponentsBySat)
+                val clockGroupBySatKey = buildClockGroupBySatKey(activeMeasurements, ifPairComponentsBySat, ssrCodeBiasAppliedSatKeys)
                 val clockGroupIds = clockGroupBySatKey.values.distinct().sorted()
                 val numClockStates = clockGroupIds.size
                 if (activeMeasurements.size < 3 + numClockStates) break
@@ -1723,6 +1763,7 @@ internal class GnssMeasurementProcessor(
 
                         val gpstSeconds = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
                         val currentTimeSeconds = if (meas.constellationType == GnssStatus.CONSTELLATION_BEIDOU) gpstSeconds - GnssMathUtils.BDT_GPST_OFFSET_SECONDS else gpstSeconds
+                        val ssrPair = ephemeris?.let { getApplicableSsrPair(meas.constellationType, meas.svid, it, usePpp) }
 
                         val clockGroupId = clockGroupBySatKey[satKey] ?: meas.constellationType
                         val currentConstellationBias =
@@ -1807,10 +1848,8 @@ internal class GnssMeasurementProcessor(
                                             transitTimeSeconds = travelTime,
                                         )
                                     // Apply SSR orbit correction if available. Gated on the broadcast
-                                    // ephemeris IOD: SSR deltas reference one specific broadcast issue,
-                                    // and applying them across an ephemeris changeover injects the
-                                    // meters-level difference between the two issues.
-                                    val ssrOrbit = getApplicableSsrOrbit(meas.constellationType, meas.svid, ephemeris)
+                                    // ephemeris IOD and atomic orbit+clock pairing (with usePpp).
+                                    val ssrOrbit = ssrPair?.first
                                     if (ssrOrbit != null) {
                                         val vel =
                                             SsrCorrectionApplicator.computeSatelliteVelocity(
@@ -1820,10 +1859,12 @@ internal class GnssMeasurementProcessor(
                                                 SatellitePositionCalculator::calculateSatellitePosition,
                                             )
                                         val dtSsr =
-                                            SsrCorrectionApplicator.ssrPolynomialAgeSeconds(
-                                                gpstSeconds,
-                                                ssrOrbit.epochTime,
-                                                ssrOrbit.updateIntervalSeconds,
+                                            ssrPolynomialAgeSeconds(
+                                                epochTime = ssrOrbit.epochTime,
+                                                updateIntervalSeconds = ssrOrbit.updateIntervalSeconds,
+                                                timescale = ssrOrbit.epochTimescale,
+                                                gpstSeconds = gpstSeconds,
+                                                currentTimeSeconds = currentTimeSeconds,
                                             )
                                         val beidouGeo =
                                             meas.constellationType == GnssStatus.CONSTELLATION_BEIDOU &&
@@ -1931,22 +1972,45 @@ internal class GnssMeasurementProcessor(
                                             constellationType = meas.constellationType,
                                             carrierFrequencyHz = meas.carrierFrequencyHz,
                                             ionosphereFree = satKey in ifCorrectedSatKeys,
-                                            clockExcludesGroupDelay = satKey in ifClockWithoutGroupDelaySatKeys,
+                                            clockExcludesGroupDelay = satKey in ifClockWithoutGroupDelaySatKeys || satKey in ssrCodeBiasAppliedSatKeys,
                                             lowerBandHz = ifPairComponentsBySat[satKey]?.fLowHz ?: GnssMathUtils.L5_FREQUENCY_HZ,
                                         )
                                     if (groupDelaySeconds.isFinite() && groupDelaySeconds != 0.0) {
                                         clockMeters -= groupDelaySeconds * SPEED_OF_LIGHT
                                     }
-                                    // Apply SSR clock correction if available (IOD-gated like the orbit)
-                                    val ssrClock = getApplicableSsrClock(meas.constellationType, meas.svid, ephemeris)
+                                    // Apply SSR clock correction if available (atomic orbit+clock pairing)
+                                    val ssrClock = ssrPair?.second
                                     if (ssrClock != null) {
                                         val dtSsr =
-                                            SsrCorrectionApplicator.ssrPolynomialAgeSeconds(
-                                                gpstSeconds,
-                                                ssrClock.epochTime,
-                                                ssrClock.updateIntervalSeconds,
+                                            ssrPolynomialAgeSeconds(
+                                                epochTime = ssrClock.epochTime,
+                                                updateIntervalSeconds = ssrClock.updateIntervalSeconds,
+                                                timescale = ssrClock.epochTimescale,
+                                                gpstSeconds = gpstSeconds,
+                                                currentTimeSeconds = currentTimeSeconds,
                                             )
                                         clockMeters = SsrCorrectionApplicator.applyClockCorrection(clockMeters, ssrClock.c0, ssrClock.c1, ssrClock.c2, dtSsr)
+                                        val hrClock =
+                                            if (ssrClock.iodSsr >= 0) {
+                                                ssrStore.getHighRateClock(meas.constellationType, meas.svid, ssrClock.iodSsr)
+                                            } else {
+                                                null
+                                            }
+                                        if (hrClock != null) {
+                                            val dtHr =
+                                                abs(
+                                                    ssrPolynomialAgeSeconds(
+                                                        epochTime = hrClock.epochTime,
+                                                        updateIntervalSeconds = hrClock.updateIntervalSeconds,
+                                                        timescale = hrClock.epochTimescale,
+                                                        gpstSeconds = gpstSeconds,
+                                                        currentTimeSeconds = currentTimeSeconds,
+                                                    ),
+                                                )
+                                            if (dtHr <= max(30.0, 2.0 * hrClock.updateIntervalSeconds)) {
+                                                clockMeters += hrClock.deltaClockMeters
+                                            }
+                                        }
                                     } else {
                                         // SBAS fast (PRC) and long-term clock corrections are an
                                         // *alternative* to SSR, not additive: both correct the same
@@ -2082,10 +2146,14 @@ internal class GnssMeasurementProcessor(
                                 )
                             }
                         val sigma =
-                            GnssMathUtils.observationSigmaMeters(
-                                sigmaCode,
-                                if (ephemeris == null) 0.0 else ephemerisAgeSeconds(ephemeris, currentTimeSeconds),
-                            )
+                            if (ssrPair != null) {
+                                hypot(sigmaCode, SSR_ORBIT_CLOCK_SIGMA_METERS)
+                            } else {
+                                GnssMathUtils.observationSigmaMeters(
+                                    sigmaCode,
+                                    if (ephemeris == null) 0.0 else ephemerisAgeSeconds(ephemeris, currentTimeSeconds),
+                                )
+                            }
                         measurementSigmas[i] = sigma
                         weights[i] = 1.0 / sigma.pow(2)
                     }
@@ -2271,7 +2339,7 @@ internal class GnssMeasurementProcessor(
                         val candidateAfterExclusion = activeMeasurements.toMutableList()
                         val excludedMeas = candidateAfterExclusion.removeAt(excludeIdx)
                         pruneSingleSatelliteConstellations(candidateAfterExclusion)
-                        val remainingClockGroups = buildClockGroupBySatKey(candidateAfterExclusion, ifPairComponentsBySat).values.distinct().size
+                        val remainingClockGroups = buildClockGroupBySatKey(candidateAfterExclusion, ifPairComponentsBySat, ssrCodeBiasAppliedSatKeys).values.distinct().size
                         if (candidateAfterExclusion.size >= 4 && candidateAfterExclusion.size >= 3 + remainingClockGroups) {
                             val why =
                                 if (raimTrippedStandardized) {
@@ -2394,6 +2462,9 @@ internal class GnssMeasurementProcessor(
                     val ephemerisSigmaCeiling =
                         activeMeasurements.maxOfOrNull { m ->
                             val eph = ephemerisMap[m.constellationType to m.svid] ?: return@maxOfOrNull 0.0
+                            if (getApplicableSsrPair(m.constellationType, m.svid, eph, usePpp) != null) {
+                                return@maxOfOrNull SSR_ORBIT_CLOCK_SIGMA_METERS
+                            }
                             val timeSeconds =
                                 if (m.constellationType == GnssStatus.CONSTELLATION_BEIDOU) {
                                     gpsTimeOfWeekSeconds - GnssMathUtils.BDT_GPST_OFFSET_SECONDS
@@ -3339,7 +3410,9 @@ internal class GnssMeasurementProcessor(
     private fun isUncalibratedBeidouBds3(
         meas: SatelliteMeasurement,
         ifPair: IfPairComponents?,
+        ssrCodeBiasApplied: Boolean = false,
     ): Boolean {
+        if (ssrCodeBiasApplied) return false
         if (meas.constellationType != GnssStatus.CONSTELLATION_BEIDOU) return false
         if (ifPair != null) {
             val upperBand = GnssSignalBand.fromFrequencyHz(ifPair.fHighHz, Constellation.BEIDOU)
@@ -3353,13 +3426,14 @@ internal class GnssMeasurementProcessor(
     private fun buildClockGroupBySatKey(
         measurements: List<SatelliteMeasurement>,
         ifPairComponentsBySat: Map<Pair<Int, Int>, IfPairComponents>,
+        ssrCodeBiasAppliedSatKeys: Set<Pair<Int, Int>> = emptySet(),
     ): Map<Pair<Int, Int>, Int> {
         var beidouCalibratedCount = 0
         var beidouUncalibratedCount = 0
         for (meas in measurements) {
             if (meas.constellationType != GnssStatus.CONSTELLATION_BEIDOU) continue
             val satKey = meas.constellationType to meas.svid
-            if (isUncalibratedBeidouBds3(meas, ifPairComponentsBySat[satKey])) {
+            if (isUncalibratedBeidouBds3(meas, ifPairComponentsBySat[satKey], satKey in ssrCodeBiasAppliedSatKeys)) {
                 beidouUncalibratedCount++
             } else {
                 beidouCalibratedCount++
@@ -3369,7 +3443,7 @@ internal class GnssMeasurementProcessor(
         return measurements.associate { meas ->
             val satKey = meas.constellationType to meas.svid
             val group =
-                if (splitBeidouClock && isUncalibratedBeidouBds3(meas, ifPairComponentsBySat[satKey])) {
+                if (splitBeidouClock && isUncalibratedBeidouBds3(meas, ifPairComponentsBySat[satKey], satKey in ssrCodeBiasAppliedSatKeys)) {
                     BEIDOU_BDS3_CLOCK_GROUP
                 } else {
                     meas.constellationType
@@ -3469,37 +3543,94 @@ internal class GnssMeasurementProcessor(
         }
 
     /**
-     * Broadcast-ephemeris IOD used to gate SSR application for this constellation, or -1 to
-     * skip the gate. GPS (IODE) and Galileo (IODnav) have well-defined matches against the
-     * SSR per-satellite IOD. BeiDou SSR IOD conventions differ between providers (AODE vs
-     * toe-derived), so the gate is skipped there rather than silently rejecting every BDS
-     * correction. An ephemeris with unknown issue (iode = -1) also skips the gate.
+     * Checks whether an SSR correction's IOD matches this broadcast ephemeris.
+     * - GPS/QZSS/Galileo: matches `ephemeris.iode` when `>= 0`.
+     * - BeiDou: matches `ephemeris.iode` (AODE) OR `(toe / 8) mod 240` (RTCM DF470).
+     * - GLONASS: matches `ephemeris.iode`, `tb` 15-min index from `gloTbGpsTow`, or `0` fallback.
      */
-    private fun ssrMatchIod(ephemeris: SatelliteEphemeris): Int = if (ephemeris.constellationType == GnssStatus.CONSTELLATION_BEIDOU) -1 else ephemeris.iode
+    private fun ssrIodMatches(
+        ephemeris: SatelliteEphemeris,
+        ssrIod: Int,
+    ): Boolean {
+        if (ssrIod < 0) return false
+        return when {
+            ephemeris.constellationType == GnssStatus.CONSTELLATION_BEIDOU -> {
+                val toeMod240 = (ephemeris.toe / 8.0).roundToInt().mod(240)
+                when {
+                    ephemeris.iode >= 0 -> ssrIod == ephemeris.iode || ssrIod == toeMod240
+                    ephemeris.toe > 0.0 -> ssrIod == toeMod240
+                    else -> true
+                }
+            }
+            ephemeris.isGlonass || ephemeris.constellationType == GnssStatus.CONSTELLATION_GLONASS -> {
+                val gloTodSeconds =
+                    (ephemeris.gloTbGpsTow - lastKnownLeapSeconds + GnssMathUtils.GLONASS_UTC_OFFSET_SECONDS)
+                        .mod(GnssMathUtils.SECONDS_IN_DAY)
+                val tbIndex = (gloTodSeconds / 900.0).roundToInt().mod(96)
+                ssrIod == ephemeris.iode || ssrIod == tbIndex || ssrIod == 0
+            }
+            ephemeris.iode >= 0 -> ssrIod == ephemeris.iode
+            else -> true
+        }
+    }
 
     /**
-     * SSR orbit correction applicable to this satellite/ephemeris, or null. GLONASS SSR is
-     * never applied: its DF386 epoch is UTC(SU) day-seconds, which is not yet converted to
-     * the GPS timescale used for the age/extrapolation terms.
+     * Atomically pairs IOD-matched SSR orbit and clock corrections when [usePpp] is enabled.
+     * Applying orbit without clock (or vice versa) breaks radial-clock cancellation.
      */
-    private fun getApplicableSsrOrbit(
+    private fun getApplicableSsrPair(
         constellationType: Int,
         svid: Int,
         ephemeris: SatelliteEphemeris,
-    ): SsrCorrections.OrbitCorrection? {
-        if (constellationType == GnssStatus.CONSTELLATION_GLONASS) return null
-        return ssrStore.getOrbit(constellationType, svid, ssrMatchIod(ephemeris))
+        usePpp: Boolean,
+    ): Pair<SsrCorrections.OrbitCorrection, SsrCorrections.ClockCorrection>? {
+        if (!usePpp) return null
+        val orbit = ssrStore.getOrbit(constellationType, svid) ?: return null
+        if (!ssrIodMatches(ephemeris, orbit.iod)) return null
+        val clock = ssrStore.getClock(constellationType, svid) ?: return null
+        if (orbit.iodSsr >= 0 && clock.iodSsr >= 0 && orbit.iodSsr != clock.iodSsr) return null
+        if (clock.iod >= 0) {
+            if (clock.iod != orbit.iod) return null
+        } else if (clock.iodSsr < 0 || clock.iodSsr != orbit.iodSsr) {
+            return null
+        }
+        return orbit to clock
     }
 
-    /** SSR clock correction applicable to this satellite/ephemeris, or null. See [getApplicableSsrOrbit]. */
-    private fun getApplicableSsrClock(
-        constellationType: Int,
-        svid: Int,
-        ephemeris: SatelliteEphemeris,
-    ): SsrCorrections.ClockCorrection? {
-        if (constellationType == GnssStatus.CONSTELLATION_GLONASS) return null
-        return ssrStore.getClock(constellationType, svid, ssrMatchIod(ephemeris))
-    }
+    private fun ssrPolynomialAgeSeconds(
+        epochTime: Double,
+        updateIntervalSeconds: Double,
+        timescale: SsrCorrections.EpochTimescale,
+        gpstSeconds: Double,
+        currentTimeSeconds: Double,
+    ): Double =
+        when (timescale) {
+            SsrCorrections.EpochTimescale.GLONASS_TOD -> {
+                val gloCurrentTodSeconds =
+                    (gpstSeconds - lastKnownLeapSeconds + GnssMathUtils.GLONASS_UTC_OFFSET_SECONDS)
+                        .mod(GnssMathUtils.SECONDS_IN_DAY)
+                SsrCorrectionApplicator.ssrPolynomialAgeSeconds(
+                    gloCurrentTodSeconds,
+                    epochTime,
+                    updateIntervalSeconds,
+                    periodSeconds = GnssMathUtils.SECONDS_IN_DAY,
+                )
+            }
+            SsrCorrections.EpochTimescale.BDT ->
+                SsrCorrectionApplicator.ssrPolynomialAgeSeconds(
+                    currentTimeSeconds,
+                    epochTime,
+                    updateIntervalSeconds,
+                    periodSeconds = GnssMathUtils.SECONDS_IN_WEEK,
+                )
+            SsrCorrections.EpochTimescale.GPST ->
+                SsrCorrectionApplicator.ssrPolynomialAgeSeconds(
+                    gpstSeconds,
+                    epochTime,
+                    updateIntervalSeconds,
+                    periodSeconds = GnssMathUtils.SECONDS_IN_WEEK,
+                )
+        }
 
     /**
      * Returns the SBAS fast pseudorange correction (PRC) for a GPS satellite, in meters.
@@ -3631,5 +3762,6 @@ internal class GnssMeasurementProcessor(
         private const val COARSE_POS_DELTA_THRESHOLD_METERS = 100_000.0
         private const val COARSE_SIGMA_ELEVATION_DEG = 45.0
         private const val BEIDOU_BDS3_CLOCK_GROUP = -GnssStatus.CONSTELLATION_BEIDOU
+        private const val SSR_ORBIT_CLOCK_SIGMA_METERS = 0.2
     }
 }
