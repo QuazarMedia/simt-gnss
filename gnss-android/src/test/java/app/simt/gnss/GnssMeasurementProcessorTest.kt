@@ -3,6 +3,8 @@ package app.simt.gnss
 import android.location.GnssNavigationMessage
 import android.location.GnssStatus
 import android.os.SystemClock
+import app.simt.gnss.core.correction.AtmosphericCorrection
+import app.simt.gnss.core.model.GnssSignalBand
 import app.simt.gnss.core.model.SatelliteEphemeris
 import app.simt.gnss.core.model.SatelliteMeasurement
 import app.simt.gnss.core.orbit.SatellitePositionCalculator
@@ -13,6 +15,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 @RunWith(RobolectricTestRunner::class)
@@ -639,5 +642,562 @@ class GnssMeasurementProcessorTest {
         assertEquals(code.altitude, phase.altitude, 0.01)
         assertEquals(code.verticalAccuracyMeters, phase.verticalAccuracyMeters, 0.01f)
         assertEquals(code.horizontalAccuracyMeters, phase.horizontalAccuracyMeters, 0.01f)
+    }
+
+    private fun buildSyntheticSkyEpoch(
+        constellationType: Int,
+        lat: Double,
+        lon: Double,
+        alt: Double,
+        gpsTimeNanos: Long,
+        carrierFrequencyHz: Double = GnssMathUtils.L1_FREQUENCY_HZ,
+        clockBiasMeters: Double = 0.0,
+        maxSatellites: Int = Int.MAX_VALUE,
+        applyAtmosphericAndRelativistic: Boolean = true,
+    ): Pair<List<SatelliteEphemeris>, List<SatelliteMeasurement>> {
+        val gpstTow = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
+        val toe =
+            if (constellationType == GnssStatus.CONSTELLATION_BEIDOU) {
+                gpstTow - GnssMathUtils.BDT_GPST_OFFSET_SECONDS
+            } else {
+                gpstTow
+            }
+        val (recX, recY, recZ) = GnssMathUtils.latLonAltToEcef(lat, lon, alt)
+        val receipt = SystemClock.elapsedRealtime()
+        val unixSeconds = GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + (gpsTimeNanos / 1_000_000_000L)
+        val utcCalendar = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        utcCalendar.timeInMillis = unixSeconds * 1000L
+        val dayOfYear = utcCalendar.get(java.util.Calendar.DAY_OF_YEAR)
+
+        val ephemerides = ArrayList<SatelliteEphemeris>()
+        val measurements = ArrayList<SatelliteMeasurement>()
+        var svid = 1
+        for (raanDeg in 0 until 360 step 30) {
+            for (meanDeg in listOf(0.0, 90.0, 180.0, 270.0)) {
+                val eph =
+                    SatelliteEphemeris(
+                        constellationType = constellationType,
+                        svid = svid,
+                        toe = toe,
+                        toc = toe,
+                        sqrtA = sqrt(26_560_000.0),
+                        eccentricity = 0.0,
+                        i0 = Math.toRadians(55.0),
+                        omega0 = Math.toRadians(raanDeg.toDouble()),
+                        omega = 0.0,
+                        m0 = Math.toRadians(meanDeg),
+                        lastUpdateTime = receipt,
+                    )
+                val rough = SatellitePositionCalculator.calculateSatellitePosition(eph, toe)
+                val roughRange =
+                    sqrt(
+                        (rough.first - recX) * (rough.first - recX) +
+                            (rough.second - recY) * (rough.second - recY) +
+                            (rough.third - recZ) * (rough.third - recZ),
+                    )
+                val flight = roughRange / GnssMathUtils.SPEED_OF_LIGHT
+                val transmit = SatellitePositionCalculator.calculateSatellitePosition(eph, toe - flight)
+                val rotated =
+                    SatellitePositionCalculator.rotateEcefForEarthRotationDuringTransit(
+                        transmit.first,
+                        transmit.second,
+                        transmit.third,
+                        flight,
+                    )
+                val (elev, az) =
+                    GnssMathUtils.ecefLosToElevationAzimuth(
+                        receiverX = recX,
+                        receiverY = recY,
+                        receiverZ = recZ,
+                        receiverLatDeg = lat,
+                        receiverLonDeg = lon,
+                        satelliteX = rotated.first,
+                        satelliteY = rotated.second,
+                        satelliteZ = rotated.third,
+                    )
+                if (elev >= 20.0 && measurements.size < maxSatellites) {
+                    val range =
+                        sqrt(
+                            (rotated.first - recX) * (rotated.first - recX) +
+                                (rotated.second - recY) * (rotated.second - recY) +
+                                (rotated.third - recZ) * (rotated.third - recZ),
+                        )
+                    val dryDelay =
+                        if (applyAtmosphericAndRelativistic) {
+                            AtmosphericCorrection.computeTroposphericDelay(elev, alt, lat, dayOfYear)
+                        } else {
+                            0.0
+                        }
+                    val ionoDelayL1 =
+                        if (applyAtmosphericAndRelativistic) {
+                            AtmosphericCorrection.computeIonosphericDelay(elev, az, lat, lon, gpsTimeNanos / 1_000_000L, null, null)
+                        } else {
+                            0.0
+                        }
+                    val ionoDelay = ionoDelayL1 * (GnssMathUtils.L1_FREQUENCY_HZ / carrierFrequencyHz).pow(2)
+                    val relCorr =
+                        if (applyAtmosphericAndRelativistic) {
+                            AtmosphericCorrection.computeRelativisticCorrection(recX, recY, recZ, rotated.first, rotated.second, rotated.third)
+                        } else {
+                            0.0
+                        }
+                    ephemerides += eph
+                    measurements +=
+                        SatelliteMeasurement(
+                            constellationType = constellationType,
+                            svid = svid,
+                            pseudorangeMeters = range + clockBiasMeters + dryDelay + ionoDelay + relCorr,
+                            carrierFrequencyHz = carrierFrequencyHz,
+                            cn0DbHz = 42.0,
+                            elevationDegrees = elev,
+                            azimuthDegrees = az,
+                            accumulatedDeltaRangeMeters = null,
+                            pseudorangeUncertaintyMeters = 0.5,
+                            isL5 = GnssSignalBand.fromFrequencyHz(carrierFrequencyHz, constellationType) == GnssSignalBand.L5_E5A_B2A,
+                        )
+                }
+                svid++
+            }
+        }
+        return ephemerides to measurements
+    }
+
+    private fun ecefDistanceMeters(
+        lat1: Double,
+        lon1: Double,
+        alt1: Double,
+        lat2: Double,
+        lon2: Double,
+        alt2: Double,
+    ): Double {
+        val a = GnssMathUtils.latLonAltToEcef(lat1, lon1, alt1)
+        val b = GnssMathUtils.latLonAltToEcef(lat2, lon2, alt2)
+        val dx = a.first - b.first
+        val dy = a.second - b.second
+        val dz = a.third - b.third
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+
+    @Test
+    fun coldStart_antipodalSydneyFromZeroSeed_convergesWithinOneMeter() {
+        val trueLat = -33.8688
+        val trueLon = 151.2093
+        val trueAlt = 50.0
+        val (ephemerides, measurements) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_GPS,
+                lat = trueLat,
+                lon = trueLon,
+                alt = trueAlt,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                clockBiasMeters = 120_000.0,
+            )
+        assertTrue("Need >= 5 visible SVs in Sydney sky, got ${measurements.size}", measurements.size >= 5)
+
+        val coldProcessor = GnssMeasurementProcessor()
+        assertEquals(ephemerides.size, coldProcessor.importExternalEphemeris(ephemerides, (syntheticGpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK))
+
+        val fix =
+            coldProcessor.computePosition(
+                measurements = measurements,
+                initialLat = 0.0,
+                initialLon = 0.0,
+                initialAlt = 0.0,
+                usePpp = false,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+            )
+        val nonNullFix = requireNotNull(fix) { "Cold-start from (0,0,0) must converge in Sydney" }
+        val errorMeters = ecefDistanceMeters(trueLat, trueLon, trueAlt, nonNullFix.latitude, nonNullFix.longitude, nonNullFix.altitude)
+        assertTrue("Cold-start antipodal error must be < 1.0 m (was $errorMeters m)", errorMeters < 1.0)
+    }
+
+    @Test
+    fun stalePppState_expiresAfterThirtySeconds_andConvergesAtNewLocation() {
+        val parisLat = 48.8566
+        val parisLon = 2.3522
+        val parisAlt = 35.0
+        val t1Nanos = 100L * GnssMathUtils.NANOS_PER_SECOND
+        val (parisEph, parisMeas) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_GPS,
+                lat = parisLat,
+                lon = parisLon,
+                alt = parisAlt,
+                gpsTimeNanos = t1Nanos,
+            )
+
+        val tokyoLat = 35.6762
+        val tokyoLon = 139.6503
+        val tokyoAlt = 40.0
+        val t2Nanos = 200L * GnssMathUtils.NANOS_PER_SECOND // dt = 100 s > 30 s
+        val (tokyoEph, tokyoMeas) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_GPS,
+                lat = tokyoLat,
+                lon = tokyoLon,
+                alt = tokyoAlt,
+                gpsTimeNanos = t2Nanos,
+            )
+
+        val pppProcessor = GnssMeasurementProcessor()
+        pppProcessor.importExternalEphemeris(parisEph, (t1Nanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK)
+        val parisFix =
+            pppProcessor.computePosition(
+                measurements = parisMeas,
+                initialLat = parisLat,
+                initialLon = parisLon,
+                initialAlt = parisAlt,
+                usePpp = true,
+                gpsTimeNanos = t1Nanos,
+            )
+        assertNotNull(parisFix)
+
+        val tokyoProcessorEph = tokyoEph.map { it.copy(svid = it.svid + 40) }
+        val tokyoMeasShifted = tokyoMeas.map { it.copy(svid = it.svid + 40) }
+        pppProcessor.importExternalEphemeris(tokyoProcessorEph, (t2Nanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK)
+
+        val tokyoFix =
+            pppProcessor.computePosition(
+                measurements = tokyoMeasShifted,
+                initialLat = 0.0,
+                initialLon = 0.0,
+                initialAlt = 0.0,
+                usePpp = true,
+                gpsTimeNanos = t2Nanos,
+            )
+        val nonNullTokyoFix = requireNotNull(tokyoFix) { "Stale PPP seed (>30 s) must expire so Tokyo fix converges from (0,0,0)" }
+        val tokyoErrorMeters = ecefDistanceMeters(tokyoLat, tokyoLon, tokyoAlt, nonNullTokyoFix.latitude, nonNullTokyoFix.longitude, nonNullTokyoFix.altitude)
+        assertTrue("Tokyo fix error must be < 1.0 m (was $tokyoErrorMeters m)", tokyoErrorMeters < 1.0)
+    }
+
+    @Test
+    fun galileoE5bAndE5aOnly_neverPairsInto27xNoiseAmplifiedIf() {
+        val trueLat = 48.8566
+        val trueLon = 2.3522
+        val trueAlt = 50.0
+        val (ephemerides, e5aMeas) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_GALILEO,
+                lat = trueLat,
+                lon = trueLon,
+                alt = trueAlt,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                carrierFrequencyHz = GnssMathUtils.L5_FREQUENCY_HZ,
+            )
+        assertTrue(e5aMeas.size >= 5)
+
+        // Add E5b with a +15 m code differential on the first SV: if erroneously paired with E5a into IF,
+        // the 27.5x amplification injects ~412 m of range error! With E5b+E5a rejected from IF pairing,
+        // single-frequency E5a stays exact (< 1 m).
+        val e5bMeas =
+            e5aMeas.mapIndexed { idx, m ->
+                m.copy(
+                    carrierFrequencyHz = GnssMathUtils.E5B_FREQUENCY_HZ,
+                    pseudorangeMeters = m.pseudorangeMeters + (if (idx == 0) 15.0 else 0.0),
+                    isL5 = false,
+                    signalBand = GnssSignalBand.E5B_B2I,
+                )
+            }
+
+        val galProcessor = GnssMeasurementProcessor()
+        galProcessor.importExternalEphemeris(ephemerides, (syntheticGpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK)
+
+        val fix =
+            galProcessor.computePosition(
+                measurements = e5bMeas + e5aMeas,
+                initialLat = trueLat,
+                initialLon = trueLon,
+                initialAlt = trueAlt,
+                usePpp = false,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+            )
+        val nonNullFix = requireNotNull(fix)
+        val errorMeters = ecefDistanceMeters(trueLat, trueLon, trueAlt, nonNullFix.latitude, nonNullFix.longitude, nonNullFix.altitude)
+        assertTrue("E5b+E5a must NOT form IF (error was $errorMeters m)", errorMeters < 1.0)
+    }
+
+    @Test
+    fun singleSvConstellationPruning_andUnderdeterminedMultiGnss() {
+        val trueLat = 48.8566
+        val trueLon = 2.3522
+        val trueAlt = 100.0
+        val tow = (syntheticGpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
+        val (gpsEph, gpsAll) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_GPS,
+                lat = trueLat,
+                lon = trueLon,
+                alt = trueAlt,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                maxSatellites = 5,
+            )
+        assertEquals(5, gpsAll.size)
+
+        val receipt = SystemClock.elapsedRealtime()
+        val gloEph =
+            SatelliteEphemeris(
+                constellationType = GnssStatus.CONSTELLATION_GLONASS,
+                svid = 1,
+                isGlonass = true,
+                gloTbGpsTow = tow,
+                gloPosX = 15_000_000.0,
+                gloPosY = 12_000_000.0,
+                gloPosZ = 17_000_000.0,
+                lastUpdateTime = receipt,
+            )
+        val gloBlunder =
+            SatelliteMeasurement(
+                constellationType = GnssStatus.CONSTELLATION_GLONASS,
+                svid = 1,
+                pseudorangeMeters = 22_000_000.0 + 50_000.0,
+                carrierFrequencyHz = GnssMathUtils.GLONASS_G1_NOMINAL_FREQUENCY_HZ,
+                cn0DbHz = 42.0,
+                elevationDegrees = 50.0,
+                azimuthDegrees = 120.0,
+                accumulatedDeltaRangeMeters = null,
+                pseudorangeUncertaintyMeters = 0.5,
+            )
+
+        val mixedProcessor = GnssMeasurementProcessor()
+        mixedProcessor.importExternalEphemeris(gpsEph + gloEph, tow)
+
+        val prunedFix =
+            mixedProcessor.computePosition(
+                measurements = gpsAll + gloBlunder,
+                initialLat = trueLat,
+                initialLon = trueLon,
+                initialAlt = trueAlt,
+                usePpp = false,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+            )
+        val nonNullPrunedFix = requireNotNull(prunedFix) { "5 GPS + 1 GLONASS blunder must prune GLONASS and solve cleanly on 5 GPS" }
+        assertEquals(5, nonNullPrunedFix.usedInFixCount)
+        val errorMeters = ecefDistanceMeters(trueLat, trueLon, trueAlt, nonNullPrunedFix.latitude, nonNullPrunedFix.longitude, nonNullPrunedFix.altitude)
+        assertTrue("Pruned 5-GPS fix must be accurate (< 1.0 m, got $errorMeters m)", errorMeters < 1.0)
+
+        // 2 GPS + 1 GAL + 1 BDS + 1 GLO (5 SVs across 4 constellations, mathematically underdetermined)
+        val (galEph, galOne) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_GALILEO,
+                lat = trueLat,
+                lon = trueLon,
+                alt = trueAlt,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                maxSatellites = 1,
+            )
+        val (bdsEph, bdsOne) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_BEIDOU,
+                lat = trueLat,
+                lon = trueLon,
+                alt = trueAlt,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                carrierFrequencyHz = GnssMathUtils.B1I_FREQUENCY_HZ,
+                maxSatellites = 1,
+            )
+        val underdeterminedProcessor = GnssMeasurementProcessor()
+        underdeterminedProcessor.importExternalEphemeris(gpsEph.take(2) + galEph + bdsEph + gloEph, tow)
+        val underdeterminedMeas = gpsAll.take(2) + galOne + bdsOne + gloBlunder
+
+        assertNull(
+            "Underdetermined 2 GPS + 1 GAL + 1 BDS + 1 GLO must return null in HIGH (QR) mode",
+            underdeterminedProcessor.computePosition(
+                measurements = underdeterminedMeas,
+                initialLat = trueLat,
+                initialLon = trueLon,
+                initialAlt = trueAlt,
+                usePpp = false,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                accuracy = GnssPositionSolver.Accuracy.HIGH,
+            ),
+        )
+        assertNull(
+            "Underdetermined 2 GPS + 1 GAL + 1 BDS + 1 GLO must return null in MEDIUM (Cholesky) mode",
+            underdeterminedProcessor.computePosition(
+                measurements = underdeterminedMeas,
+                initialLat = trueLat,
+                initialLon = trueLon,
+                initialAlt = trueAlt,
+                usePpp = false,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                accuracy = GnssPositionSolver.Accuracy.MEDIUM,
+            ),
+        )
+    }
+
+    @Test
+    fun signalBandClassification_mapsAllBandsAccurately() {
+        assertEquals(GnssSignalBand.L1_E1_B1C, GnssSignalBand.fromFrequencyHz(GnssMathUtils.L1_FREQUENCY_HZ, GnssStatus.CONSTELLATION_GPS))
+        assertEquals(GnssSignalBand.L1_E1_B1C, GnssSignalBand.fromFrequencyHz(GnssMathUtils.GLONASS_G1_NOMINAL_FREQUENCY_HZ, GnssStatus.CONSTELLATION_GLONASS))
+        assertEquals(GnssSignalBand.B1I, GnssSignalBand.fromFrequencyHz(GnssMathUtils.B1I_FREQUENCY_HZ, GnssStatus.CONSTELLATION_BEIDOU))
+        assertEquals(GnssSignalBand.B3I, GnssSignalBand.fromFrequencyHz(GnssMathUtils.B3I_FREQUENCY_HZ, GnssStatus.CONSTELLATION_BEIDOU))
+        assertEquals(GnssSignalBand.L2, GnssSignalBand.fromFrequencyHz(1_227_600_000.0, GnssStatus.CONSTELLATION_GPS))
+        assertEquals(GnssSignalBand.E5B_B2I, GnssSignalBand.fromFrequencyHz(GnssMathUtils.E5B_FREQUENCY_HZ, GnssStatus.CONSTELLATION_GALILEO))
+        assertEquals(GnssSignalBand.L5_E5A_B2A, GnssSignalBand.fromFrequencyHz(GnssMathUtils.L5_FREQUENCY_HZ, GnssStatus.CONSTELLATION_GALILEO))
+        assertEquals(GnssSignalBand.UNKNOWN, GnssSignalBand.fromFrequencyHz(0.0, GnssStatus.CONSTELLATION_GPS))
+        assertEquals(GnssSignalBand.UNKNOWN, GnssSignalBand.fromFrequencyHz(Double.NaN, GnssStatus.CONSTELLATION_GPS))
+    }
+
+    @Test
+    fun dualFrequencyIf_galileoE1E5bAndIfSigmaScaling_workCleanly() {
+        val trueLat = 48.8566
+        val trueLon = 2.3522
+        val trueAlt = 50.0
+        val (ephemerides, e1Meas) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_GALILEO,
+                lat = trueLat,
+                lon = trueLon,
+                alt = trueAlt,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                carrierFrequencyHz = GnssMathUtils.L1_FREQUENCY_HZ,
+                applyAtmosphericAndRelativistic = false,
+            )
+        assertTrue(e1Meas.size >= 6)
+
+        val toe = (syntheticGpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
+        val (recX, recY, recZ) = GnssMathUtils.latLonAltToEcef(trueLat, trueLon, trueAlt)
+        val unixSeconds = GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + (syntheticGpsTimeNanos / 1_000_000_000L)
+        val utcCalendar = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        utcCalendar.timeInMillis = unixSeconds * 1000L
+        val dayOfYear = utcCalendar.get(java.util.Calendar.DAY_OF_YEAR)
+
+        val bgdA = 1.2e-9
+        val bgdB = 2.5e-9
+        val c = GnssMathUtils.SPEED_OF_LIGHT
+        val inavEph =
+            ephemerides.map {
+                it.copy(
+                    tgd = bgdB,
+                    galileoBgdE1E5aSeconds = bgdA,
+                    galileoBgdE1E5bSeconds = bgdB,
+                    galileoInavClock = true,
+                )
+            }
+
+        // Build E1 and E5b with realistic I/NAV BGD + troposphere + 1/f^2 ionosphere
+        val dualMeas = mutableListOf<SatelliteMeasurement>()
+        e1Meas.forEachIndexed { idx, base ->
+            val eph = inavEph[idx]
+            val dryDelay = AtmosphericCorrection.computeTroposphericDelay(base.elevationDegrees, trueAlt, trueLat, dayOfYear)
+            val ionoL1 = 8.0
+            val ionoE5b = ionoL1 * (GnssMathUtils.L1_FREQUENCY_HZ / GnssMathUtils.E5B_FREQUENCY_HZ).pow(2)
+            val tx = SatellitePositionCalculator.calculateSatellitePosition(eph, toe)
+            val relCorr = AtmosphericCorrection.computeRelativisticCorrection(recX, recY, recZ, tx.first, tx.second, tx.third)
+            // Add +3.5 m noise on E5b of SV 0 (with IF sigma scaling, z_i stays well below 4 sigma;
+            // without IF sigma scaling, ~2.31 * 3.5 m = 8.1 m residual against ~0.77 m sigma would exceed 10 sigma and trigger false RAIM!)
+            val e5bNoise = if (idx == 0) 3.5 else 0.0
+            val pE1 = base.pseudorangeMeters + dryDelay + ionoL1 + relCorr + c * bgdB
+            val pE5b = base.pseudorangeMeters + dryDelay + ionoE5b + relCorr + c * (GnssMathUtils.L1_FREQUENCY_HZ / GnssMathUtils.E5B_FREQUENCY_HZ).pow(2) * bgdB + e5bNoise
+            dualMeas += base.copy(pseudorangeMeters = pE1, carrierFrequencyHz = GnssMathUtils.L1_FREQUENCY_HZ, signalBand = GnssSignalBand.L1_E1_B1C)
+            dualMeas +=
+                base.copy(
+                    pseudorangeMeters = pE5b,
+                    carrierFrequencyHz = GnssMathUtils.E5B_FREQUENCY_HZ,
+                    pseudorangeUncertaintyMeters = 2.0,
+                    signalBand = GnssSignalBand.E5B_B2I,
+                )
+        }
+
+        val galProcessor = GnssMeasurementProcessor()
+        galProcessor.importExternalEphemeris(inavEph, toe)
+        val fix =
+            galProcessor.computePosition(
+                measurements = dualMeas,
+                initialLat = trueLat,
+                initialLon = trueLon,
+                initialAlt = trueAlt,
+                usePpp = false,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+            )
+        val nonNullFix = requireNotNull(fix)
+        // With proper IF sigma propagation (sigmaLow >= 2.0 -> sigmaIf >= 3.2 m), SV 0 is NOT falsely excluded by RAIM!
+        assertEquals("SV 0 with moderate E5b noise must not be falsely excluded when IF sigma is scaled", e1Meas.size, nonNullFix.usedInFixCount)
+    }
+
+    @Test
+    fun mixedBeidouB1iAndB1cB2a_splitsClockStatesAndEliminatesInterSignalBias() {
+        val trueLat = 48.8566
+        val trueLon = 2.3522
+        val trueAlt = 50.0
+        val (bdsEph, bdsBaseMeas) =
+            buildSyntheticSkyEpoch(
+                constellationType = GnssStatus.CONSTELLATION_BEIDOU,
+                lat = trueLat,
+                lon = trueLon,
+                alt = trueAlt,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+                carrierFrequencyHz = GnssMathUtils.B1I_FREQUENCY_HZ,
+                clockBiasMeters = 10_000.0,
+                applyAtmosphericAndRelativistic = false,
+            )
+        assertTrue("Need >= 8 BeiDou SVs for split-clock test, got ${bdsBaseMeas.size}", bdsBaseMeas.size >= 8)
+
+        val toe = (syntheticGpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK - GnssMathUtils.BDT_GPST_OFFSET_SECONDS
+        val (recX, recY, recZ) = GnssMathUtils.latLonAltToEcef(trueLat, trueLon, trueAlt)
+        val unixSeconds = GnssMathUtils.GPS_EPOCH_UNIX_SECONDS + (syntheticGpsTimeNanos / 1_000_000_000L)
+        val utcCalendar = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        utcCalendar.timeInMillis = unixSeconds * 1000L
+        val dayOfYear = utcCalendar.get(java.util.Calendar.DAY_OF_YEAR)
+        val c = GnssMathUtils.SPEED_OF_LIGHT
+        val tgd1 = 1.5e-8
+        val unmodeledBds3OffsetMeters = 18.0
+
+        val splitIdx = bdsBaseMeas.size / 2
+        val ephWithTgd = bdsEph.map { it.copy(tgd = tgd1) }
+        val mixedMeas = mutableListOf<SatelliteMeasurement>()
+        bdsBaseMeas.forEachIndexed { idx, base ->
+            val eph = ephWithTgd[idx]
+            val dryDelay = AtmosphericCorrection.computeTroposphericDelay(base.elevationDegrees, trueAlt, trueLat, dayOfYear)
+            val rough = SatellitePositionCalculator.calculateSatellitePosition(eph, toe)
+            val roughRange = sqrt((rough.first - recX).pow(2) + (rough.second - recY).pow(2) + (rough.third - recZ).pow(2))
+            val flight = roughRange / c
+            val transmit = SatellitePositionCalculator.calculateSatellitePosition(eph, toe - flight)
+            val rotated = SatellitePositionCalculator.rotateEcefForEarthRotationDuringTransit(transmit.first, transmit.second, transmit.third, flight)
+            val relCorr = AtmosphericCorrection.computeRelativisticCorrection(recX, recY, recZ, rotated.first, rotated.second, rotated.third)
+            if (idx < splitIdx) {
+                // B3I-calibrated single-frequency B1I (includes c * TGD1 + Klobuchar iono)
+                val ionoB1i = AtmosphericCorrection.computeIonosphericDelay(base.elevationDegrees, base.azimuthDegrees, trueLat, trueLon, syntheticGpsTimeNanos / 1_000_000L, null, null) * (GnssMathUtils.L1_FREQUENCY_HZ / GnssMathUtils.B1I_FREQUENCY_HZ).pow(2)
+                mixedMeas +=
+                    base.copy(
+                        pseudorangeMeters = base.pseudorangeMeters + dryDelay + ionoB1i + relCorr + c * tgd1,
+                        carrierFrequencyHz = GnssMathUtils.B1I_FREQUENCY_HZ,
+                        signalBand = GnssSignalBand.B1I,
+                    )
+            } else {
+                // Uncalibrated BDS-3 B1C + B2a IF pair with an 18 m systematic inter-signal bias
+                val ionoL1 = AtmosphericCorrection.computeIonosphericDelay(base.elevationDegrees, base.azimuthDegrees, trueLat, trueLon, syntheticGpsTimeNanos / 1_000_000L, null, null)
+                val ionoB2a = ionoL1 * (GnssMathUtils.L1_FREQUENCY_HZ / GnssMathUtils.L5_FREQUENCY_HZ).pow(2)
+                mixedMeas +=
+                    base.copy(
+                        pseudorangeMeters = base.pseudorangeMeters + dryDelay + ionoL1 + relCorr + unmodeledBds3OffsetMeters,
+                        carrierFrequencyHz = GnssMathUtils.L1_FREQUENCY_HZ,
+                        signalBand = GnssSignalBand.L1_E1_B1C,
+                    )
+                mixedMeas +=
+                    base.copy(
+                        pseudorangeMeters = base.pseudorangeMeters + dryDelay + ionoB2a + relCorr + unmodeledBds3OffsetMeters,
+                        carrierFrequencyHz = GnssMathUtils.L5_FREQUENCY_HZ,
+                        isL5 = true,
+                        signalBand = GnssSignalBand.L5_E5A_B2A,
+                    )
+            }
+        }
+
+        val bdsProcessor = GnssMeasurementProcessor()
+        bdsProcessor.importExternalEphemeris(ephWithTgd, (syntheticGpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK)
+        val fix =
+            bdsProcessor.computePosition(
+                measurements = mixedMeas,
+                initialLat = trueLat,
+                initialLon = trueLon,
+                initialAlt = trueAlt,
+                usePpp = false,
+                gpsTimeNanos = syntheticGpsTimeNanos,
+            )
+        val nonNullFix = requireNotNull(fix) { "Mixed BeiDou B1I + B1C/B2a epoch must solve cleanly" }
+        val errorMeters = ecefDistanceMeters(trueLat, trueLon, trueAlt, nonNullFix.latitude, nonNullFix.longitude, nonNullFix.altitude)
+        assertTrue("Separate BDS-3 clock state must absorb 18 m offset (error=$errorMeters m)", errorMeters < 1.0)
+        assertEquals(bdsBaseMeas.size, nonNullFix.usedInFixCount)
     }
 }

@@ -16,6 +16,8 @@ import app.simt.gnss.core.filter.GnssInterEpochKalmanFilter
 import app.simt.gnss.core.filter.HatchFilter
 import app.simt.gnss.core.filter.carrierDeltaMatchesPseudorangeRate
 import app.simt.gnss.core.filter.receiverClockStepMeters
+import app.simt.gnss.core.model.Constellation
+import app.simt.gnss.core.model.GnssSignalBand
 import app.simt.gnss.core.model.GnssSolutionMode
 import app.simt.gnss.core.model.PositionResult
 import app.simt.gnss.core.model.SatelliteEphemeris
@@ -148,10 +150,19 @@ internal class GnssMeasurementProcessor(
 
         fun hasLastPosition(): Boolean = lastX != null
 
-        fun getLastPositionEcef(): Triple<Double, Double, Double>? {
+        fun getLastPositionEcef(
+            currentTimeNanos: Long = 0L,
+            maxAgeNanos: Long = PPP_SEED_MAX_AGE_NANOS,
+        ): Triple<Double, Double, Double>? {
             val x = lastX ?: return null
             val y = lastY ?: return null
             val z = lastZ ?: return null
+            if (currentTimeNanos > 0L &&
+                lastTimeNanos > 0L &&
+                (currentTimeNanos < lastTimeNanos || currentTimeNanos - lastTimeNanos > maxAgeNanos)
+            ) {
+                return null
+            }
             return Triple(x, y, z)
         }
 
@@ -185,6 +196,17 @@ internal class GnssMeasurementProcessor(
         val iscL1CaSeconds: Double,
         val iscL5I5Seconds: Double,
         val lastUpdateElapsedMs: Long,
+    )
+
+    private class IfPairComponents(
+        val fHighHz: Double,
+        val fLowHz: Double,
+        val sigmaAndroidHighMeters: Double,
+        val cn0HighDbHz: Double,
+        val smoothingHighEpochs: Int,
+        val sigmaAndroidLowMeters: Double,
+        val cn0LowDbHz: Double,
+        val smoothingLowEpochs: Int,
     )
 
     /**
@@ -276,14 +298,7 @@ internal class GnssMeasurementProcessor(
                         GnssNavigationMessage.TYPE_GPS_L2CNAV,
                         GnssNavigationMessage.TYPE_GPS_L5CNAV,
                         -> {
-                            GpsCnavMt30Parser.parseL1L5IscIfComplete(data)?.let { isc ->
-                                gpsCnavIscMap[satKey] =
-                                    GpsCnavIscRecord(
-                                        iscL1CaSeconds = isc.iscL1CaSeconds,
-                                        iscL5I5Seconds = isc.iscL5I5Seconds,
-                                        lastUpdateElapsedMs = SystemClock.elapsedRealtime(),
-                                    )
-                            }
+                            recordGpsCnavMt30Isc(svid, data)
                         }
                     }
                 }
@@ -762,7 +777,8 @@ internal class GnssMeasurementProcessor(
         key: Pair<Int, Int>,
         meas: SatelliteMeasurement,
         clockBiases: DoubleArray,
-        constellationToIndex: Map<Int, Int>,
+        clockGroupToIndex: Map<Int, Int>,
+        clockGroupBySatKey: Map<Pair<Int, Int>, Int>,
         gpstSeconds: Double,
     ): ReceptionSatellite? {
         val ephemeris = ephemerisMap[key]?.takeIf { isUsableEphemerisLocked(it, gpstSeconds) } ?: return null
@@ -772,7 +788,8 @@ internal class GnssMeasurementProcessor(
             } else {
                 gpstSeconds
             }
-        val bias = clockBiases[constellationToIndex[meas.constellationType] ?: 0]
+        val clockGroup = clockGroupBySatKey[key] ?: meas.constellationType
+        val bias = clockBiases[clockGroupToIndex[clockGroup] ?: 0]
         val satelliteClock =
             SatellitePositionCalculator.getSatelliteClockCorrection(
                 ephemeris,
@@ -830,7 +847,8 @@ internal class GnssMeasurementProcessor(
         receiverY: Double,
         receiverZ: Double,
         clockBiases: DoubleArray,
-        constellationToIndex: Map<Int, Int>,
+        clockGroupToIndex: Map<Int, Int>,
+        clockGroupBySatKey: Map<Pair<Int, Int>, Int>,
         gpstSeconds: Double,
     ): DopplerVelocitySolver.Solution? {
         val bestBySatellite = LinkedHashMap<Pair<Int, Int>, SatelliteMeasurement>()
@@ -846,7 +864,7 @@ internal class GnssMeasurementProcessor(
         }
         val observations = ArrayList<DopplerVelocitySolver.Observation>(bestBySatellite.size)
         for ((key, meas) in bestBySatellite) {
-            val sat = receptionSatellite(key, meas, clockBiases, constellationToIndex, gpstSeconds) ?: continue
+            val sat = receptionSatellite(key, meas, clockBiases, clockGroupToIndex, clockGroupBySatKey, gpstSeconds) ?: continue
             val dx = sat.x - receiverX
             val dy = sat.y - receiverY
             val dz = sat.z - receiverZ
@@ -887,7 +905,8 @@ internal class GnssMeasurementProcessor(
     private fun tdcpDisplacement(
         measurements: List<SatelliteMeasurement>,
         clockBiases: DoubleArray,
-        constellationToIndex: Map<Int, Int>,
+        clockGroupToIndex: Map<Int, Int>,
+        clockGroupBySatKey: Map<Pair<Int, Int>, Int>,
         gpstSeconds: Double,
         gpsTimeNanos: Long,
     ): TdcpDisplacementSolver.Displacement? {
@@ -913,7 +932,7 @@ internal class GnssMeasurementProcessor(
                     rateUncertaintyMetersPerSecond = meas.pseudorangeRateUncertaintyMetersPerSecond,
                 )
             if (agrees != true) continue
-            val sat = receptionSatellite(key, meas, clockBiases, constellationToIndex, gpstSeconds) ?: continue
+            val sat = receptionSatellite(key, meas, clockBiases, clockGroupToIndex, clockGroupBySatKey, gpstSeconds) ?: continue
             val dx = sat.x - anchor.first
             val dy = sat.y - anchor.second
             val dz = sat.z - anchor.third
@@ -945,7 +964,8 @@ internal class GnssMeasurementProcessor(
         positionY: Double,
         positionZ: Double,
         clockBiases: DoubleArray,
-        constellationToIndex: Map<Int, Int>,
+        clockGroupToIndex: Map<Int, Int>,
+        clockGroupBySatKey: Map<Pair<Int, Int>, Int>,
         gpstSeconds: Double,
         gpsTimeNanos: Long,
     ) {
@@ -956,8 +976,8 @@ internal class GnssMeasurementProcessor(
             val adr = meas.accumulatedDeltaRangeMeters ?: continue
             if (!hasValidAdr(meas.adrState) || isCarrierHalfCycleAmbiguous(meas.adrState)) continue
             val key = meas.constellationType to meas.svid
-            if (tdcpSignals.containsKey(key) && meas.isL5) continue
-            val sat = receptionSatellite(key, meas, clockBiases, constellationToIndex, gpstSeconds) ?: continue
+            if (tdcpSignals.containsKey(key) && !effectiveSignalBand(meas).isUpperBand) continue
+            val sat = receptionSatellite(key, meas, clockBiases, clockGroupToIndex, clockGroupBySatKey, gpstSeconds) ?: continue
             tdcpSignals[key] =
                 TdcpSignal(
                     frequencyHz = meas.carrierFrequencyHz,
@@ -1165,7 +1185,21 @@ internal class GnssMeasurementProcessor(
                 if (measurement.cn0DbHz < 25.0) continue
                 if (hasStatusElevation && elevationRaw < 15.0) continue
 
-                val isL5 = measurement.carrierFrequencyHz < GnssMathUtils.L5_FREQUENCY_THRESHOLD_HZ
+                val effectiveFreqHz =
+                    if (!measurement.hasCarrierFrequencyHz() ||
+                        !measurement.carrierFrequencyHz.isFinite() ||
+                        measurement.carrierFrequencyHz <= 0f
+                    ) {
+                        when (constellationType) {
+                            GnssStatus.CONSTELLATION_GLONASS -> GnssMathUtils.GLONASS_G1_NOMINAL_FREQUENCY_HZ
+                            GnssStatus.CONSTELLATION_BEIDOU -> GnssMathUtils.B1I_FREQUENCY_HZ
+                            else -> GnssMathUtils.L1_FREQUENCY_HZ
+                        }
+                    } else {
+                        measurement.carrierFrequencyHz.toDouble()
+                    }
+                val signalBand = GnssSignalBand.fromFrequencyHz(effectiveFreqHz, constellationType)
+                val isL5 = signalBand == GnssSignalBand.L5_E5A_B2A
 
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N || !clock.hasFullBiasNanos()) continue
 
@@ -1200,7 +1234,7 @@ internal class GnssMeasurementProcessor(
                     Triple(
                         constellationType,
                         svid,
-                        (measurement.carrierFrequencyHz / 1e6).toInt(),
+                        (effectiveFreqHz / 1e6).toInt(),
                     )
                 val smoothedPr =
                     when (smoothingMode) {
@@ -1246,7 +1280,7 @@ internal class GnssMeasurementProcessor(
                         SmoothingMode.DOPPLER -> dopplerSmoother.currentSmoothingCount(signalKey).coerceAtMost(DOPPLER_EFFECTIVE_MAX_SMOOTHING_EPOCHS)
                     }
 
-                val wavelength = SPEED_OF_LIGHT / measurement.carrierFrequencyHz
+                val wavelength = SPEED_OF_LIGHT / effectiveFreqHz
                 val carrierPhaseMeters = if (hasValidAdr(adrState)) adrMeters else null
 
                 processedMeasurements.add(
@@ -1255,7 +1289,7 @@ internal class GnssMeasurementProcessor(
                         svid = svid,
                         pseudorangeMeters = smoothedPr,
                         rawPseudorangeMeters = pseudorangeMeters,
-                        carrierFrequencyHz = measurement.carrierFrequencyHz.toDouble(),
+                        carrierFrequencyHz = effectiveFreqHz,
                         cn0DbHz = measurement.cn0DbHz,
                         elevationDegrees = elevationDegrees,
                         azimuthDegrees = azimuthDegrees,
@@ -1269,6 +1303,7 @@ internal class GnssMeasurementProcessor(
                         pseudorangeRateMetersPerSecond = measurement.pseudorangeRateMetersPerSecond,
                         pseudorangeRateUncertaintyMetersPerSecond = measurement.pseudorangeRateUncertaintyMetersPerSecond,
                         smoothingEpochs = smoothingEpochs,
+                        signalBand = signalBand,
                     ),
                 )
 
@@ -1394,6 +1429,17 @@ internal class GnssMeasurementProcessor(
         synchronized(lock) {
             if (measurements.size < 4) return null
 
+            val nowTow = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
+            val usableEphemerisBySat = HashMap<Pair<Int, Int>, SatelliteEphemeris>()
+            for (meas in measurements) {
+                val satKey = meas.constellationType to meas.svid
+                if (!usableEphemerisBySat.containsKey(satKey)) {
+                    ephemerisMap[satKey]
+                        ?.takeIf { isUsableEphemerisLocked(it, nowTow) }
+                        ?.let { usableEphemerisBySat[satKey] = it }
+                }
+            }
+
             val groupedBySv = measurements.groupBy { it.constellationType to it.svid }
             // Use a mutable list that we can modify during RAIM iteration
             var activeMeasurements = mutableListOf<SatelliteMeasurement>()
@@ -1401,25 +1447,61 @@ internal class GnssMeasurementProcessor(
             // IF-combined SVs whose satellite clock must EXCLUDE the broadcast group delay
             // (LNAV/BGD path: the per-signal biases cancel in the IF combination).
             val ifClockWithoutGroupDelaySatKeys = mutableSetOf<Pair<Int, Int>>()
+            val ifPairComponentsBySat = HashMap<Pair<Int, Int>, IfPairComponents>()
 
             // Initial filtering and IF combination
             for ((satKey, svMeasurements) in groupedBySv) {
-                val l1 = svMeasurements.find { !it.isL5 }
-                val l5 = svMeasurements.find { it.isL5 }
+                val upperCandidates =
+                    svMeasurements
+                        .filter { m ->
+                            m.carrierFrequencyHz.isFinite() &&
+                                m.carrierFrequencyHz > 0.0 &&
+                                effectiveSignalBand(m).isUpperBand
+                        }.sortedWith(
+                            compareBy<SatelliteMeasurement>(
+                                { upperBandPreferenceRank(satKey.first, effectiveSignalBand(it)) },
+                                { -it.cn0DbHz },
+                            ),
+                        )
+                val lowerCandidates =
+                    svMeasurements
+                        .filter { m ->
+                            m.carrierFrequencyHz.isFinite() &&
+                                m.carrierFrequencyHz > 0.0 &&
+                                effectiveSignalBand(m).isLowerBand
+                        }.sortedWith(
+                            compareBy<SatelliteMeasurement>(
+                                { lowerBandPreferenceRank(effectiveSignalBand(it)) },
+                                { -it.cn0DbHz },
+                            ),
+                        )
 
-                if (l1 != null && l5 != null) {
-                    val f1 = l1.carrierFrequencyHz
-                    val f5 = l5.carrierFrequencyHz
+                var selectedPair: Pair<SatelliteMeasurement, SatelliteMeasurement>? = null
+                for (upper in upperCandidates) {
+                    val lower =
+                        lowerCandidates.firstOrNull { cand ->
+                            abs(upper.carrierFrequencyHz - cand.carrierFrequencyHz) >= MIN_IF_FREQUENCY_SEPARATION_HZ
+                        }
+                    if (lower != null) {
+                        selectedPair = upper to lower
+                        break
+                    }
+                }
 
-                    val ephemerisForIf =
-                        ephemerisMap[satKey]?.takeIf { isUsableEphemerisLocked(it, (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK) }
+                if (selectedPair != null) {
+                    val (upper, lower) = selectedPair
+                    val f1 = upper.carrierFrequencyHz
+                    val f2 = lower.carrierFrequencyHz
+                    val ephemerisForIf = usableEphemerisBySat[satKey]
 
                     val ifAdjustment =
                         codePseudorangesForIonosphereFreeMeters(
                             satKey = satKey,
-                            l1Meters = l1.pseudorangeMeters,
-                            l5Meters = l5.pseudorangeMeters,
+                            l1Meters = upper.pseudorangeMeters,
+                            l5Meters = lower.pseudorangeMeters,
                             ephemeris = ephemerisForIf,
+                            upperBandHz = f1,
+                            lowerBandHz = f2,
                         )
                     val l1CodeForIf = ifAdjustment.l1Meters
                     val l5CodeForIf = ifAdjustment.l5Meters
@@ -1428,25 +1510,37 @@ internal class GnssMeasurementProcessor(
                     }
 
                     // Pseudorange IF Combination
-                    val prIf = ((f1 * f1) * l1CodeForIf - (f5 * f5) * l5CodeForIf) / (f1 * f1 - f5 * f5)
+                    val f1Sq = f1 * f1
+                    val f2Sq = f2 * f2
+                    val denom = f1Sq - f2Sq
+                    val prIf = (f1Sq * l1CodeForIf - f2Sq * l5CodeForIf) / denom
 
                     // Carrier Phase IF Combination (if available)
                     val cpIf =
-                        l1.carrierPhaseMeters?.let { cp1 ->
-                            l5.carrierPhaseMeters?.let { cp5 ->
-                                ((f1 * f1) * cp1 - (f5 * f5) * cp5) / (f1 * f1 - f5 * f5)
+                        upper.carrierPhaseMeters?.let { cp1 ->
+                            lower.carrierPhaseMeters?.let { cp2 ->
+                                (f1Sq * cp1 - f2Sq * cp2) / denom
                             }
                         }
 
-                    val f1Sq = f1 * f1
-                    val f5Sq = f5 * f5
-                    val denom = f1Sq - f5Sq
-                    val sigma1 = l1.pseudorangeUncertaintyMeters
-                    val sigma5 = l5.pseudorangeUncertaintyMeters
-                    val sigmaIf = sqrt((f1Sq * f1Sq * sigma1 * sigma1 + f5Sq * f5Sq * sigma5 * sigma5) / (denom * denom))
+                    val sigma1 = upper.pseudorangeUncertaintyMeters
+                    val sigma2 = lower.pseudorangeUncertaintyMeters
+                    val sigmaIf = sqrt((f1Sq * f1Sq * sigma1 * sigma1 + f2Sq * f2Sq * sigma2 * sigma2) / (denom * denom))
+
+                    ifPairComponentsBySat[satKey] =
+                        IfPairComponents(
+                            fHighHz = f1,
+                            fLowHz = f2,
+                            sigmaAndroidHighMeters = upper.pseudorangeUncertaintyMeters,
+                            cn0HighDbHz = upper.cn0DbHz,
+                            smoothingHighEpochs = upper.smoothingEpochs,
+                            sigmaAndroidLowMeters = lower.pseudorangeUncertaintyMeters,
+                            cn0LowDbHz = lower.cn0DbHz,
+                            smoothingLowEpochs = lower.smoothingEpochs,
+                        )
 
                     activeMeasurements.add(
-                        l1.copy(
+                        upper.copy(
                             pseudorangeMeters = prIf,
                             carrierPhaseMeters = cpIf,
                             pseudorangeUncertaintyMeters = sigmaIf,
@@ -1454,7 +1548,7 @@ internal class GnssMeasurementProcessor(
                     )
                     ifCorrectedSatKeys.add(satKey)
                 } else {
-                    activeMeasurements.add(l1 ?: svMeasurements.first())
+                    activeMeasurements.add(upperCandidates.firstOrNull() ?: lowerCandidates.firstOrNull() ?: svMeasurements.first())
                 }
             }
 
@@ -1468,14 +1562,13 @@ internal class GnssMeasurementProcessor(
             // (~100–500 km per SV), these measurements destroy the WLS solution.
             // Uses extended validity (24h Keplerian / 6h GLONASS) so positioning works offline.
             val preEphemerisCount = activeMeasurements.size
-            val nowTow = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
             activeMeasurements.removeAll { measurement ->
-                val satKey = measurement.constellationType to measurement.svid
-                ephemerisMap[satKey]?.let { isUsableEphemerisLocked(it, nowTow) } != true
+                (measurement.constellationType to measurement.svid) !in usableEphemerisBySat
             }
             if (activeMeasurements.size < preEphemerisCount) {
                 Log.d(TAG, "Filtered ${preEphemerisCount - activeMeasurements.size} measurements without ephemeris, kept ${activeMeasurements.size}")
             }
+            pruneSingleSatelliteConstellations(activeMeasurements)
             if (activeMeasurements.size < 4) {
                 Log.d(TAG, "Not enough measurements with ephemeris (${activeMeasurements.size}/4 minimum) — cannot solve")
                 return null
@@ -1485,6 +1578,9 @@ internal class GnssMeasurementProcessor(
             // loop. The exclusion budget (maxExclusions) is enforced in the RAIM branch below,
             // so the loop is bounded solely by having enough satellites to solve.
             while (activeMeasurements.size >= 4) {
+                pruneSingleSatelliteConstellations(activeMeasurements)
+                if (activeMeasurements.size < 4) break
+
                 // --- Standard WLS / PPP Logic Start ---
 
                 // All SVs now have ephemeris (approximate-geometry-only SVs were filtered out above)
@@ -1506,24 +1602,42 @@ internal class GnssMeasurementProcessor(
                         utcCalendar.get(java.util.Calendar.DAY_OF_YEAR)
                     }
 
-                var (currentX, currentY, currentZ) =
+                val pppSeed =
                     if (usePpp) {
-                        pppState.getLastPositionEcef() ?: GnssMathUtils.latLonAltToEcef(initialLat, initialLon, initialAlt)
+                        val candidate = pppState.getLastPositionEcef(currentTimeNanos = gpsTimeNanos)
+                        if (candidate != null && (initialLat != 0.0 || initialLon != 0.0)) {
+                            val (initX, initY, initZ) = GnssMathUtils.latLonAltToEcef(initialLat, initialLon, initialAlt)
+                            val dx = candidate.first - initX
+                            val dy = candidate.second - initY
+                            val dz = candidate.third - initZ
+                            if (sqrt(dx * dx + dy * dy + dz * dz) > MAX_PPP_SEED_DEVIATION_METERS) null else candidate
+                        } else {
+                            candidate
+                        }
                     } else {
-                        GnssMathUtils.latLonAltToEcef(initialLat, initialLon, initialAlt)
+                        null
                     }
+                var (currentX, currentY, currentZ) =
+                    pppSeed ?: GnssMathUtils.latLonAltToEcef(initialLat, initialLon, initialAlt)
+                var coarsePositionEstimate =
+                    (pppSeed == null && initialLat == 0.0 && initialLon == 0.0) ||
+                        (currentX * currentX + currentY * currentY + currentZ * currentZ < COARSE_ECEF_RADIUS_SQ_THRESHOLD)
 
-                // Handle multi-constellation clock biases (ISB)
-                val constellationTypes = activeMeasurements.map { it.constellationType }.distinct().sorted()
-                val numConstellations = constellationTypes.size
-                val constellationToIndex = constellationTypes.withIndex().associate { it.value to it.index }
+                // Handle multi-constellation clock biases (ISB), splitting BeiDou B3I-calibrated vs
+                // uncalibrated BDS-3 (B1C/B2a) into two clock groups when both sub-groups have >= 2 SVs.
+                val clockGroupBySatKey = buildClockGroupBySatKey(activeMeasurements, ifPairComponentsBySat)
+                val clockGroupIds = clockGroupBySatKey.values.distinct().sorted()
+                val numClockStates = clockGroupIds.size
+                if (activeMeasurements.size < 3 + numClockStates) break
+                val clockGroupToIndex = clockGroupIds.withIndex().associate { it.value to it.index }
 
-                val clockBiases = DoubleArray(numConstellations) { 0.0 }
+                val clockBiases = DoubleArray(numClockStates) { 0.0 }
                 var lastResidualsRms = 0.0
                 // A-posteriori variance-of-unit-weight (reduced chi-square), dimensionless. Scales the
                 // metric formal covariance for honest accuracy/Kalman-R reporting; 1.0 = fit matches
                 // the a-priori measurement model. Floored at 1.0 so we never report better than formal.
                 var lastVarianceFactor = 1.0
+                var lastRedundancyAllRows = 0
 
                 var maxResidual = 0.0
                 var maxResidualIdx = -1
@@ -1554,7 +1668,7 @@ internal class GnssMeasurementProcessor(
                     // (review #85). The troposphere stays fully modelled. Sequential PPP is
                     // what would make the phase informative.
                     val n = activeMeasurements.size
-                    val m = 3 + numConstellations
+                    val m = 3 + numClockStates
 
                     designMatrix = Array(n) { DoubleArray(m) }
                     observationVector = DoubleArray(n)
@@ -1566,14 +1680,14 @@ internal class GnssMeasurementProcessor(
                     for (i in activeMeasurements.indices) {
                         val meas = activeMeasurements[i]
                         val satKey = meas.constellationType to meas.svid
-                        val ephemeris =
-                            ephemerisMap[satKey]?.takeIf { isUsableEphemerisLocked(it, (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK) }
+                        val ephemeris = usableEphemerisBySat[satKey]
 
                         val gpstSeconds = (gpsTimeNanos / 1e9) % GnssMathUtils.SECONDS_IN_WEEK
                         val currentTimeSeconds = if (meas.constellationType == GnssStatus.CONSTELLATION_BEIDOU) gpstSeconds - GnssMathUtils.BDT_GPST_OFFSET_SECONDS else gpstSeconds
 
+                        val clockGroupId = clockGroupBySatKey[satKey] ?: meas.constellationType
                         val currentConstellationBias =
-                            clockBiases[constellationToIndex[meas.constellationType] ?: 0]
+                            clockBiases[clockGroupToIndex[clockGroupId] ?: 0]
 
                         // Per-SV model terms (satellite ECEF + clock, ionosphere, troposphere) depend only
                         // on the ephemeris/clock-bias and the observer geometry, which converge within the
@@ -1584,7 +1698,7 @@ internal class GnssMeasurementProcessor(
                         // skipping the per-iteration Kepler solve and Klobuchar evaluation. The
                         // line-of-sight, range, relativistic (Shapiro) and residual below are still rebuilt
                         // every iteration from the current receiver position.
-                        val cachedModel = if (ephemeris != null) svModelCache[satKey] else null
+                        val cachedModel = if (ephemeris != null && !coarsePositionEstimate) svModelCache[satKey] else null
                         val reuseModel =
                             cachedModel != null &&
                                 abs(currentX - cachedModel.refX) <= GnssMathUtils.WLS_MODEL_REUSE_DISTANCE_METERS &&
@@ -1733,12 +1847,16 @@ internal class GnssMeasurementProcessor(
                             iterAzimuthDeg = computedAzimuthDeg
 
                             dryDelay =
-                                AtmosphericCorrection.computeTroposphericDelay(
-                                    iterElevationDeg,
-                                    observerAlt,
-                                    observerLat,
-                                    dayOfYear,
-                                )
+                                if (coarsePositionEstimate) {
+                                    0.0
+                                } else {
+                                    AtmosphericCorrection.computeTroposphericDelay(
+                                        iterElevationDeg,
+                                        observerAlt,
+                                        observerLat,
+                                        dayOfYear,
+                                    )
+                                }
 
                             // Single-frequency ionosphere: Klobuchar with the broadcast α/β (and the
                             // geomagnetic-latitude step), scaled per carrier below. Galileo SVs use
@@ -1747,7 +1865,7 @@ internal class GnssMeasurementProcessor(
                             // coefficients are fitted against, making its output unvalidated and
                             // regionally worse than Klobuchar — a real NeQuick-G needs those tables.
                             ionoDelayL1 =
-                                if (ifCorrectedSatKeys.contains(satKey)) {
+                                if (coarsePositionEstimate || ifCorrectedSatKeys.contains(satKey)) {
                                     0.0
                                 } else {
                                     AtmosphericCorrection.computeIonosphericDelay(iterElevationDeg, iterAzimuthDeg, observerLat, observerLon, gpsTimeNanos / 1_000_000L, ionoAlpha, ionoBeta)
@@ -1775,6 +1893,7 @@ internal class GnssMeasurementProcessor(
                                             carrierFrequencyHz = meas.carrierFrequencyHz,
                                             ionosphereFree = satKey in ifCorrectedSatKeys,
                                             clockExcludesGroupDelay = satKey in ifClockWithoutGroupDelaySatKeys,
+                                            lowerBandHz = ifPairComponentsBySat[satKey]?.fLowHz ?: GnssMathUtils.L5_FREQUENCY_HZ,
                                         )
                                     if (groupDelaySeconds.isFinite() && groupDelaySeconds != 0.0) {
                                         clockMeters -= groupDelaySeconds * SPEED_OF_LIGHT
@@ -1802,7 +1921,7 @@ internal class GnssMeasurementProcessor(
                                     0.0
                                 }
 
-                            if (ephemeris != null) {
+                            if (ephemeris != null && !coarsePositionEstimate) {
                                 svModelCache[satKey] =
                                     SvModelTerms(
                                         refX = currentX,
@@ -1833,7 +1952,7 @@ internal class GnssMeasurementProcessor(
                         designMatrix[i][0] = -dx
                         designMatrix[i][1] = -dy
                         designMatrix[i][2] = -dz
-                        val constellationIdx = constellationToIndex[meas.constellationType] ?: 0
+                        val constellationIdx = clockGroupToIndex[clockGroupId] ?: 0
                         designMatrix[i][3 + constellationIdx] = 1.0
 
                         // Klobuchar returns the slant delay at the GPS L1 frequency. Scale to the
@@ -1864,20 +1983,65 @@ internal class GnssMeasurementProcessor(
 
                         // Observation variance model: combine Android's `receivedSvTimeUncertaintyNanos × c`
                         // (a *time-tagging* floor, typically <1 m) with the physical elevation-/C/N₀-dependent
-                        // code noise model σ² = (a² + b²/sin²el) · 10^(−(CN₀−CN₀_ref)/10). This replaces the
-                        // previous product of (1/σ_Android²) · sin²(el) · 10^((CN₀−CN₀_ref)/10), which double-
-                        // applied an elevation-weighting term while leaving multipath noise un-modelled.
-                        val sigmaAndroid =
-                            meas.pseudorangeUncertaintyMeters.coerceIn(
-                                GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
-                                GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
-                            )
-                        val sigmaModel = GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(iterElevationDeg, meas.cn0DbHz, meas.smoothingEpochs)
+                        // code noise model σ² = (a² + b²/sin²el) · 10^(−(CN₀−CN₀_ref)/10). On IF-combined
+                        // rows, propagate each band's physical sigma through the IF variance factor.
+                        val sigmaElevationDeg = if (coarsePositionEstimate) COARSE_SIGMA_ELEVATION_DEG else iterElevationDeg
+                        val ifComponents = ifPairComponentsBySat[satKey]
                         val sigmaCode =
-                            max(sigmaAndroid, sigmaModel).coerceIn(
-                                GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
-                                GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
-                            )
+                            if (ifComponents != null) {
+                                val sigmaAndroidHigh =
+                                    ifComponents.sigmaAndroidHighMeters.coerceIn(
+                                        GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
+                                        GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
+                                    )
+                                val sigmaAndroidLow =
+                                    ifComponents.sigmaAndroidLowMeters.coerceIn(
+                                        GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
+                                        GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
+                                    )
+                                val sigmaHigh =
+                                    max(
+                                        sigmaAndroidHigh,
+                                        GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(
+                                            sigmaElevationDeg,
+                                            ifComponents.cn0HighDbHz,
+                                            ifComponents.smoothingHighEpochs,
+                                        ),
+                                    )
+                                val sigmaLow =
+                                    max(
+                                        sigmaAndroidLow,
+                                        GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(
+                                            sigmaElevationDeg,
+                                            ifComponents.cn0LowDbHz,
+                                            ifComponents.smoothingLowEpochs,
+                                        ),
+                                    )
+                                val f1Sq = ifComponents.fHighHz * ifComponents.fHighHz
+                                val f2Sq = ifComponents.fLowHz * ifComponents.fLowHz
+                                val denom = abs(f1Sq - f2Sq)
+                                (sqrt(f1Sq * f1Sq * sigmaHigh * sigmaHigh + f2Sq * f2Sq * sigmaLow * sigmaLow) / denom)
+                                    .coerceIn(
+                                        GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
+                                        GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
+                                    )
+                            } else {
+                                val sigmaAndroid =
+                                    meas.pseudorangeUncertaintyMeters.coerceIn(
+                                        GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
+                                        GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
+                                    )
+                                val sigmaModel =
+                                    GnssMathUtils.pseudorangeSigmaFromElevationAndCn0(
+                                        sigmaElevationDeg,
+                                        meas.cn0DbHz,
+                                        meas.smoothingEpochs,
+                                    )
+                                max(sigmaAndroid, sigmaModel).coerceIn(
+                                    GnssMathUtils.MIN_PSEUDORANGE_SIGMA_METERS,
+                                    GnssMathUtils.MAX_PSEUDORANGE_SIGMA_METERS,
+                                )
+                            }
                         val sigma =
                             GnssMathUtils.observationSigmaMeters(
                                 sigmaCode,
@@ -1897,15 +2061,16 @@ internal class GnssMeasurementProcessor(
                     currentY += deltaX[1]
                     currentZ += deltaX[2]
 
-                    for (j in 0 until numConstellations) {
+                    for (j in 0 until numClockStates) {
                         clockBiases[j] += deltaX[3 + j]
                     }
 
                     val posDelta = sqrt(deltaX[0].pow(2) + deltaX[1].pow(2) + deltaX[2].pow(2))
-                    val maxClockDelta = (3 until deltaX.size.coerceAtMost(3 + numConstellations)).maxOfOrNull { abs(deltaX[it]) } ?: 0.0
-                    val converged = posDelta < positionConvergenceThresholdMeters && maxClockDelta < clockConvergenceThresholdMeters
+                    val maxClockDelta = (3 until deltaX.size.coerceAtMost(3 + numClockStates)).maxOfOrNull { abs(deltaX[it]) } ?: 0.0
+                    val converged = !coarsePositionEstimate && posDelta < positionConvergenceThresholdMeters && maxClockDelta < clockConvergenceThresholdMeters
 
                     if (!converged) {
+                        coarsePositionEstimate = posDelta > COARSE_POS_DELTA_THRESHOLD_METERS
                         if (iter == 0 || iter == maxWlsIterations - 1) {
                             val ephCount = activeMeasurements.count { m -> ephemerisMap[m.constellationType to m.svid]?.let(::isFreshEphemerisLocked) == true }
                             Log.d(
@@ -1931,7 +2096,7 @@ internal class GnssMeasurementProcessor(
                     // values (and arbitrary ones once phase rows entered the normal matrix).
                     dopMatrix =
                         run {
-                            val mGeo = 3 + numConstellations
+                            val mGeo = 3 + numClockStates
                             val normal = Array(mGeo) { DoubleArray(mGeo) }
                             for (i in 0 until activeMeasurements.size) {
                                 if (weights[i] <= 0.0) continue
@@ -2020,6 +2185,7 @@ internal class GnssMeasurementProcessor(
                         sumWeightedSqResidualsAllRows += weights[i] * res * res
                     }
                     val redundancyAllRows = validRowsAll - m
+                    lastRedundancyAllRows = redundancyAllRows
                     lastVarianceFactor =
                         if (redundancyAllRows > 0) {
                             (sumWeightedSqResidualsAllRows / redundancyAllRows).coerceAtLeast(1.0)
@@ -2051,27 +2217,34 @@ internal class GnssMeasurementProcessor(
                     val standardizedRaimAvailable = maxStandardizedResidualIdx >= 0
                     val raimTrippedStandardized =
                         standardizedRaimAvailable &&
-                            activeMeasurements.size > 4 &&
+                            lastRedundancyAllRows > 0 &&
+                            activeMeasurements.size - 1 >= 4 &&
                             maxStandardizedResidual > GnssMathUtils.RAIM_STANDARDIZED_RESIDUAL_SIGMA
                     val raimTrippedAbsolute =
                         !standardizedRaimAvailable &&
-                            activeMeasurements.size > 4 &&
+                            lastRedundancyAllRows > 0 &&
+                            activeMeasurements.size - 1 >= 4 &&
                             maxResidual > raimResidualThresholdMeters
 
                     if ((raimTrippedStandardized || raimTrippedAbsolute) && excludedCount < maxExclusions) {
                         val excludeIdx =
                             if (raimTrippedStandardized) maxStandardizedResidualIdx else maxResidualIdx
-                        val svid = activeMeasurements[excludeIdx].svid
-                        val why =
-                            if (raimTrippedStandardized) {
-                                "standardized z=${"%.2f".format(maxStandardizedResidual)}σ (r=${"%.1f".format(maxResidual)}m)"
-                            } else {
-                                "absolute residual ${"%.1f".format(maxResidual)}m"
-                            }
-                        Log.w(TAG, "RAIM: Outlier detected! Excluding SVID $svid ($why). Retrying...")
-                        activeMeasurements.removeAt(excludeIdx)
-                        excludedCount++
-                        continue
+                        val candidateAfterExclusion = activeMeasurements.toMutableList()
+                        val excludedMeas = candidateAfterExclusion.removeAt(excludeIdx)
+                        pruneSingleSatelliteConstellations(candidateAfterExclusion)
+                        val remainingClockGroups = buildClockGroupBySatKey(candidateAfterExclusion, ifPairComponentsBySat).values.distinct().size
+                        if (candidateAfterExclusion.size >= 4 && candidateAfterExclusion.size >= 3 + remainingClockGroups) {
+                            val why =
+                                if (raimTrippedStandardized) {
+                                    "standardized z=${"%.2f".format(maxStandardizedResidual)}σ (r=${"%.1f".format(maxResidual)}m)"
+                                } else {
+                                    "absolute residual ${"%.1f".format(maxResidual)}m"
+                                }
+                            Log.w(TAG, "RAIM: Outlier detected! Excluding SVID ${excludedMeas.svid} ($why). Retrying...")
+                            activeMeasurements = candidateAfterExclusion
+                            excludedCount++
+                            continue
+                        }
                     }
 
                     // If we get here, either no outlier or the exclusion cap was reached.
@@ -2089,7 +2262,8 @@ internal class GnssMeasurementProcessor(
                             currentY,
                             currentZ,
                             clockBiases,
-                            constellationToIndex,
+                            clockGroupToIndex,
+                            clockGroupBySatKey,
                             gpstSeconds,
                         )
                     val displacement =
@@ -2097,7 +2271,8 @@ internal class GnssMeasurementProcessor(
                             tdcpDisplacement(
                                 activeMeasurements,
                                 clockBiases,
-                                constellationToIndex,
+                                clockGroupToIndex,
+                                clockGroupBySatKey,
                                 gpstSeconds,
                                 gpsTimeNanos,
                             )
@@ -2138,14 +2313,15 @@ internal class GnssMeasurementProcessor(
                             outY,
                             outZ,
                             clockBiases,
-                            constellationToIndex,
+                            clockGroupToIndex,
+                            clockGroupBySatKey,
                             gpstSeconds,
                             gpsTimeNanos,
                         )
                     }
                     pppState.updatePosition(outX, outY, outZ, gpsTimeNanos)
 
-                    val dopsAndAccuracy = computeDopsAndAccuracy(solutionWrapper.covarianceMatrix, dopMatrix, lat, lon, lastVarianceFactor, numConstellations)
+                    val dopsAndAccuracy = computeDopsAndAccuracy(solutionWrapper.covarianceMatrix, dopMatrix, lat, lon, lastVarianceFactor, numClockStates)
 
                     // Accepted fixes keep the WLS accuracy. A coasted epoch publishes the
                     // prediction, so its accuracy is the predicted covariance, and at least
@@ -2251,7 +2427,7 @@ internal class GnssMeasurementProcessor(
         val byKey = LinkedHashMap<Pair<Int, Int>, RtkAmbiguityMemory.Sample>()
         for (meas in measurements) {
             val key = meas.constellationType to meas.svid
-            if (byKey.containsKey(key) && meas.isL5) continue
+            if (byKey.containsKey(key) && !effectiveSignalBand(meas).isUpperBand) continue
             byKey[key] =
                 RtkAmbiguityMemory.Sample(
                     constellationType = meas.constellationType,
@@ -2412,7 +2588,7 @@ internal class GnssMeasurementProcessor(
             }
 
             val seedRover =
-                pppState.getLastPositionEcef()?.let { doubleArrayOf(it.first, it.second, it.third) }
+                pppState.getLastPositionEcef(currentTimeNanos = gpsTimeNanos)?.let { doubleArrayOf(it.first, it.second, it.third) }
                     ?: if (initialLat != 0.0 || initialLon != 0.0) {
                         val (sx, sy, sz) = GnssMathUtils.latLonAltToEcef(initialLat, initialLon, initialAlt)
                         doubleArrayOf(sx, sy, sz)
@@ -2617,33 +2793,42 @@ internal class GnssMeasurementProcessor(
         carrierFrequencyHz: Double,
         ionosphereFree: Boolean,
         clockExcludesGroupDelay: Boolean,
+        lowerBandHz: Double = GnssMathUtils.L5_FREQUENCY_HZ,
     ): Double {
-        if (constellationType == GnssStatus.CONSTELLATION_GALILEO) {
-            return galileoGroupDelaySeconds(ephemeris, carrierFrequencyHz, ionosphereFree)
-        }
         if (clockExcludesGroupDelay) return 0.0
+        if (constellationType == GnssStatus.CONSTELLATION_GALILEO) {
+            return galileoGroupDelaySeconds(ephemeris, carrierFrequencyHz, ionosphereFree, lowerBandHz)
+        }
+        if (constellationType == GnssStatus.CONSTELLATION_BEIDOU) {
+            if (ionosphereFree) return 0.0
+            return when (GnssSignalBand.fromFrequencyHz(carrierFrequencyHz, Constellation.BEIDOU)) {
+                GnssSignalBand.B1I -> if (ephemeris.tgd.isFinite()) ephemeris.tgd else 0.0
+                GnssSignalBand.E5B_B2I -> if (ephemeris.beidouTgd2Seconds.isFinite()) ephemeris.beidouTgd2Seconds else 0.0
+                else -> 0.0
+            }
+        }
         val tgdSeconds = ephemeris.tgd
         if (!tgdSeconds.isFinite() || tgdSeconds == 0.0) return 0.0
-        if (ionosphereFree ||
-            constellationType == GnssStatus.CONSTELLATION_BEIDOU ||
-            carrierFrequencyHz <= 0.0
-        ) {
+        if (ionosphereFree || carrierFrequencyHz <= 0.0) {
             return tgdSeconds
         }
         return tgdSeconds * (GnssMathUtils.L1_FREQUENCY_HZ / carrierFrequencyHz).pow(2)
     }
 
     /**
-     * Galileo OS SIS ICD §5.1.5. γ₅ₐ = (f_E1 / f)².
+     * Galileo OS SIS ICD §5.1.5. γ = (f_E1 / f)².
      * E1 uses the clock's own BGD. E5a with an F/NAV clock is γ·BGD(E1,E5a); with an
-     * I/NAV clock it is BGD(E1,E5b) + (γ − 1)·BGD(E1,E5a). The E1/E5a ionosphere-free
-     * combination is 0 for F/NAV and BGD(E1,E5b) − BGD(E1,E5a) for I/NAV.
+     * I/NAV clock it is BGD(E1,E5b) + (γ − 1)·BGD(E1,E5a). E5b with an I/NAV clock is
+     * γ·BGD(E1,E5b); with an F/NAV clock it is BGD(E1,E5a) + (γ − 1)·BGD(E1,E5b).
+     * The E1/E5a ionosphere-free combination is 0 for F/NAV and BGD(E1,E5b) − BGD(E1,E5a)
+     * for I/NAV; E1/E5b is 0 for I/NAV and BGD(E1,E5a) − BGD(E1,E5b) for F/NAV.
      * A record that only carries [SatelliteEphemeris.tgd] is treated as F/NAV BGD(E1,E5a).
      */
     internal fun galileoGroupDelaySeconds(
         ephemeris: SatelliteEphemeris,
         carrierFrequencyHz: Double,
         ionosphereFree: Boolean,
+        lowerBandHz: Double = GnssMathUtils.L5_FREQUENCY_HZ,
     ): Double {
         val legacy =
             !ephemeris.galileoInavClock &&
@@ -2652,18 +2837,28 @@ internal class GnssMeasurementProcessor(
         val bgdA = if (legacy) ephemeris.tgd else ephemeris.galileoBgdE1E5aSeconds
         val bgdB = if (legacy) ephemeris.tgd else ephemeris.galileoBgdE1E5bSeconds
         if (!bgdA.isFinite() || !bgdB.isFinite()) return 0.0
-        if (ionosphereFree) return if (ephemeris.galileoInavClock) bgdB - bgdA else 0.0
-        val e5a = carrierFrequencyHz > 0.0 && carrierFrequencyHz < GnssMathUtils.L5_FREQUENCY_THRESHOLD_HZ
+        if (ionosphereFree) {
+            val lowerBand = GnssSignalBand.fromFrequencyHz(lowerBandHz, Constellation.GALILEO)
+            return if (lowerBand == GnssSignalBand.E5B_B2I) {
+                if (ephemeris.galileoInavClock) 0.0 else bgdA - bgdB
+            } else {
+                if (ephemeris.galileoInavClock) bgdB - bgdA else 0.0
+            }
+        }
+        val band = GnssSignalBand.fromFrequencyHz(carrierFrequencyHz, Constellation.GALILEO)
         val gamma =
             if (carrierFrequencyHz > 0.0) {
                 (GnssMathUtils.L1_FREQUENCY_HZ / carrierFrequencyHz).pow(2)
             } else {
                 1.0
             }
-        return if (e5a) {
-            if (ephemeris.galileoInavClock) bgdB + (gamma - 1.0) * bgdA else gamma * bgdA
-        } else {
-            (if (ephemeris.galileoInavClock) bgdB else bgdA) * gamma
+        return when (band) {
+            GnssSignalBand.L5_E5A_B2A ->
+                if (ephemeris.galileoInavClock) bgdB + (gamma - 1.0) * bgdA else gamma * bgdA
+            GnssSignalBand.E5B_B2I ->
+                if (ephemeris.galileoInavClock) gamma * bgdB else bgdA + (gamma - 1.0) * bgdB
+            else ->
+                (if (ephemeris.galileoInavClock) bgdB else bgdA) * gamma
         }
     }
 
@@ -2673,36 +2868,171 @@ internal class GnssMeasurementProcessor(
      *
      * - **GPS with recent CNAV MT30:** applies **+ISC·c** to L1 and L5 per IS-GPS-705; the IF
      *   observable is then referenced to L1 P(Y) and pairs with the −TGD clock.
-     * - **GPS LNAV / Galileo BGD fallback:** **no adjustment.** Per IS-GPS-200/705 the L1 bias
-     *   relative to the broadcast clock is c·TGD and the L5 bias c·γ₁₅·TGD, whose IF combination
-     *   is identically zero — so the raw IF observable pairs with the clock **without** −TGD.
-     *   (The previous +TGD·c on L5 together with the −TGD clock left ≈ −2.26·c·TGD per SV, up
-     *   to ±8 m, on every dual-frequency fix.)
-     * - **BeiDou D1:** raw L1/L5 with the −TGD1 clock kept (TGD2 is not decoded; B1I-referenced
-     *   TGD1 is the closest available convention).
+     * - **GPS LNAV / Galileo BGD fallback:** **no adjustment** on aligned pairs; for Galileo
+     *   I/NAV on E1/E5b the IF bias is 0 (`clockIncludesGroupDelay = false`), while on E1/E5a
+     *   it pairs with `BGD(E1,E5b) − BGD(E1,E5a)` (`clockIncludesGroupDelay = true`).
+     * - **BeiDou D1/RINEX (B3I clock reference):** subtracts `c·TGD1` from `B1I` and `c·TGD2`
+     *   from `B2I` before forming the IF combination (`0` on `B3I`, `B1C`, `B2a`), aligning the
+     *   IF observable to the B3I broadcast clock (`clockIncludesGroupDelay = false`).
      */
+    internal fun recordGpsCnavMt30Isc(
+        svid: Int,
+        data: ByteArray,
+    ) {
+        GpsCnavMt30Parser.parseL1L5IscIfComplete(data)?.let { isc ->
+            gpsCnavIscMap[GnssStatus.CONSTELLATION_GPS to svid] =
+                GpsCnavIscRecord(
+                    iscL1CaSeconds = isc.iscL1CaSeconds,
+                    iscL5I5Seconds = isc.iscL5I5Seconds,
+                    lastUpdateElapsedMs = SystemClock.elapsedRealtime(),
+                )
+        }
+    }
+
     internal fun codePseudorangesForIonosphereFreeMeters(
         satKey: Pair<Int, Int>,
         l1Meters: Double,
         l5Meters: Double,
         ephemeris: SatelliteEphemeris?,
+        upperBandHz: Double =
+            if (satKey.first == GnssStatus.CONSTELLATION_BEIDOU) {
+                GnssMathUtils.B1I_FREQUENCY_HZ
+            } else {
+                GnssMathUtils.L1_FREQUENCY_HZ
+            },
+        lowerBandHz: Double = GnssMathUtils.L5_FREQUENCY_HZ,
     ): IfCodeAdjustment {
         if (satKey.first == GnssStatus.CONSTELLATION_BEIDOU) {
-            return IfCodeAdjustment(l1Meters, l5Meters, clockIncludesGroupDelay = true)
+            val upperBand = GnssSignalBand.fromFrequencyHz(upperBandHz, Constellation.BEIDOU)
+            val lowerBand = GnssSignalBand.fromFrequencyHz(lowerBandHz, Constellation.BEIDOU)
+            val upperAdjusted =
+                if (ephemeris != null &&
+                    upperBand == GnssSignalBand.B1I &&
+                    ephemeris.tgd.isFinite() &&
+                    ephemeris.tgd != 0.0
+                ) {
+                    l1Meters - ephemeris.tgd * SPEED_OF_LIGHT
+                } else {
+                    l1Meters
+                }
+            val lowerAdjusted =
+                if (ephemeris != null &&
+                    lowerBand == GnssSignalBand.E5B_B2I &&
+                    ephemeris.beidouTgd2Seconds.isFinite() &&
+                    ephemeris.beidouTgd2Seconds != 0.0
+                ) {
+                    l5Meters - ephemeris.beidouTgd2Seconds * SPEED_OF_LIGHT
+                } else {
+                    l5Meters
+                }
+            return IfCodeAdjustment(upperAdjusted, lowerAdjusted, clockIncludesGroupDelay = false)
+        }
+        if (satKey.first == GnssStatus.CONSTELLATION_GALILEO && ephemeris != null) {
+            val lowerBand = GnssSignalBand.fromFrequencyHz(lowerBandHz, Constellation.GALILEO)
+            val clockIncludesGroupDelay =
+                if (lowerBand == GnssSignalBand.E5B_B2I) {
+                    !ephemeris.galileoInavClock
+                } else {
+                    ephemeris.galileoInavClock
+                }
+            return IfCodeAdjustment(l1Meters, l5Meters, clockIncludesGroupDelay = clockIncludesGroupDelay)
         }
         if (satKey.first == GnssStatus.CONSTELLATION_GPS) {
-            val iscRec = gpsCnavIscMap[satKey]
-            if (iscRec != null &&
-                SystemClock.elapsedRealtime() - iscRec.lastUpdateElapsedMs < GnssMathUtils.EPHEMERIS_STALENESS_MS
-            ) {
-                return IfCodeAdjustment(
-                    l1Meters = l1Meters + iscRec.iscL1CaSeconds * SPEED_OF_LIGHT,
-                    l5Meters = l5Meters + iscRec.iscL5I5Seconds * SPEED_OF_LIGHT,
-                    clockIncludesGroupDelay = true,
-                )
+            val upperBand = GnssSignalBand.fromFrequencyHz(upperBandHz, Constellation.GPS)
+            val lowerBand = GnssSignalBand.fromFrequencyHz(lowerBandHz, Constellation.GPS)
+            if (upperBand == GnssSignalBand.L1_E1_B1C && lowerBand == GnssSignalBand.L5_E5A_B2A) {
+                val iscRec = gpsCnavIscMap[satKey]
+                if (iscRec != null &&
+                    SystemClock.elapsedRealtime() - iscRec.lastUpdateElapsedMs < GnssMathUtils.EPHEMERIS_STALENESS_MS
+                ) {
+                    return IfCodeAdjustment(
+                        l1Meters = l1Meters + iscRec.iscL1CaSeconds * SPEED_OF_LIGHT,
+                        l5Meters = l5Meters + iscRec.iscL5I5Seconds * SPEED_OF_LIGHT,
+                        clockIncludesGroupDelay = true,
+                    )
+                }
             }
         }
         return IfCodeAdjustment(l1Meters, l5Meters, clockIncludesGroupDelay = false)
+    }
+
+    private fun effectiveSignalBand(meas: SatelliteMeasurement): GnssSignalBand {
+        val fromFreq = GnssSignalBand.fromFrequencyHz(meas.carrierFrequencyHz, meas.constellationType)
+        return if (fromFreq != GnssSignalBand.UNKNOWN) fromFreq else meas.signalBand
+    }
+
+    private fun upperBandPreferenceRank(
+        constellationType: Int,
+        band: GnssSignalBand,
+    ): Int =
+        if (constellationType == GnssStatus.CONSTELLATION_BEIDOU) {
+            when (band) {
+                GnssSignalBand.B1I -> 0
+                GnssSignalBand.L1_E1_B1C -> 1
+                else -> Int.MAX_VALUE
+            }
+        } else {
+            when (band) {
+                GnssSignalBand.L1_E1_B1C -> 0
+                GnssSignalBand.B1I -> 1
+                else -> Int.MAX_VALUE
+            }
+        }
+
+    private fun lowerBandPreferenceRank(band: GnssSignalBand): Int =
+        when (band) {
+            GnssSignalBand.L5_E5A_B2A -> 0
+            GnssSignalBand.E5B_B2I -> 1
+            GnssSignalBand.L2 -> 2
+            GnssSignalBand.B3I -> 3
+            else -> Int.MAX_VALUE
+        }
+
+    private fun pruneSingleSatelliteConstellations(measurements: MutableList<SatelliteMeasurement>) {
+        val countsByConstellation = measurements.groupingBy { it.constellationType }.eachCount()
+        measurements.removeAll { (countsByConstellation[it.constellationType] ?: 0) < 2 }
+    }
+
+    private fun isUncalibratedBeidouBds3(
+        meas: SatelliteMeasurement,
+        ifPair: IfPairComponents?,
+    ): Boolean {
+        if (meas.constellationType != GnssStatus.CONSTELLATION_BEIDOU) return false
+        if (ifPair != null) {
+            val upperBand = GnssSignalBand.fromFrequencyHz(ifPair.fHighHz, Constellation.BEIDOU)
+            val lowerBand = GnssSignalBand.fromFrequencyHz(ifPair.fLowHz, Constellation.BEIDOU)
+            return upperBand == GnssSignalBand.L1_E1_B1C || lowerBand == GnssSignalBand.L5_E5A_B2A
+        }
+        val band = effectiveSignalBand(meas)
+        return band == GnssSignalBand.L1_E1_B1C || band == GnssSignalBand.L5_E5A_B2A
+    }
+
+    private fun buildClockGroupBySatKey(
+        measurements: List<SatelliteMeasurement>,
+        ifPairComponentsBySat: Map<Pair<Int, Int>, IfPairComponents>,
+    ): Map<Pair<Int, Int>, Int> {
+        var beidouCalibratedCount = 0
+        var beidouUncalibratedCount = 0
+        for (meas in measurements) {
+            if (meas.constellationType != GnssStatus.CONSTELLATION_BEIDOU) continue
+            val satKey = meas.constellationType to meas.svid
+            if (isUncalibratedBeidouBds3(meas, ifPairComponentsBySat[satKey])) {
+                beidouUncalibratedCount++
+            } else {
+                beidouCalibratedCount++
+            }
+        }
+        val splitBeidouClock = beidouCalibratedCount >= 2 && beidouUncalibratedCount >= 2
+        return measurements.associate { meas ->
+            val satKey = meas.constellationType to meas.svid
+            val group =
+                if (splitBeidouClock && isUncalibratedBeidouBds3(meas, ifPairComponentsBySat[satKey])) {
+                    BEIDOU_BDS3_CLOCK_GROUP
+                } else {
+                    meas.constellationType
+                }
+            satKey to group
+        }
     }
 
     /**
@@ -2943,5 +3273,13 @@ internal class GnssMeasurementProcessor(
         /** Upper clamp for travel time (~117 ms, corresponding to ~35,000 km). */
         private const val MAX_TRAVEL_TIME_SECONDS =
             MAX_REASONABLE_PSEUDORANGE_METERS / SPEED_OF_LIGHT
+
+        private const val PPP_SEED_MAX_AGE_NANOS = 30_000_000_000L
+        private const val MAX_PPP_SEED_DEVIATION_METERS = 50_000.0
+        private const val MIN_IF_FREQUENCY_SEPARATION_HZ = 250_000_000.0
+        private const val COARSE_ECEF_RADIUS_SQ_THRESHOLD = 3.0e13
+        private const val COARSE_POS_DELTA_THRESHOLD_METERS = 100_000.0
+        private const val COARSE_SIGMA_ELEVATION_DEG = 45.0
+        private const val BEIDOU_BDS3_CLOCK_GROUP = -GnssStatus.CONSTELLATION_BEIDOU
     }
 }

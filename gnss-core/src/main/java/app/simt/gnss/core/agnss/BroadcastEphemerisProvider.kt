@@ -4,6 +4,7 @@ import app.simt.gnss.core.model.SatelliteEphemeris
 import app.simt.gnss.core.platform.GnssPlatform
 import app.simt.gnss.core.utils.GnssMathUtils
 import java.io.BufferedReader
+import kotlin.math.abs
 
 /**
  * Parses broadcast ephemeris from RINEX 3 mixed navigation file content.
@@ -489,7 +490,10 @@ object BroadcastEphemerisProvider {
             val l6 = record[6]
             val satH1 = parseRinexDouble(l6, 23, 19).toInt()
             if (satH1 != 0) return null
-            val tgd = parseRinexDouble(l6, 42, 19)
+            val rawTgd1 = parseRinexDouble(l6, 42, 19)
+            val rawTgd2 = parseRinexDouble(l6, 61, 19)
+            val tgd = if (rawTgd1.isFinite() && abs(rawTgd1) <= 1e-6) rawTgd1 else 0.0
+            val tgd2 = if (rawTgd2.isFinite() && abs(rawTgd2) <= 1e-6) rawTgd2 else 0.0
 
             SatelliteEphemeris(
                 constellationType = Constellation.BEIDOU,
@@ -516,6 +520,7 @@ object BroadcastEphemerisProvider {
                 cic = cic,
                 cis = cis,
                 tgd = tgd,
+                beidouTgd2Seconds = tgd2,
                 lastUpdateTime = now,
             )
         } catch (e: Exception) {

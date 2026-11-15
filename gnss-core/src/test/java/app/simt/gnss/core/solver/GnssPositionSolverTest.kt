@@ -114,4 +114,39 @@ class GnssPositionSolverTest {
         assertEquals(3, solution!!.deltaX.size)
         assertEquals(3, solution.covarianceMatrix.size)
     }
+
+    @Test
+    fun choleskySolver_underdeterminedOrZeroWeight_returnsNull() {
+        val aUnder =
+            arrayOf(
+                doubleArrayOf(1.0, 0.0, 0.0, 1.0, 0.0),
+                doubleArrayOf(0.0, 1.0, 0.0, 1.0, 0.0),
+                doubleArrayOf(0.0, 0.0, 1.0, 1.0, 0.0),
+                doubleArrayOf(1.0, 1.0, 1.0, 0.0, 1.0),
+            )
+        assertNull(
+            GnssPositionSolver.solve(
+                aUnder,
+                doubleArrayOf(1.0, 1.0, 1.0, 1.0),
+                doubleArrayOf(1.0, 1.0, 1.0, 1.0),
+                accuracy = GnssPositionSolver.Accuracy.MEDIUM,
+            ),
+        )
+
+        val aZeroWeight =
+            arrayOf(
+                doubleArrayOf(1.0, 0.0, 0.0, 1.0),
+                doubleArrayOf(0.0, 1.0, 0.0, 1.0),
+                doubleArrayOf(0.0, 0.0, 1.0, 1.0),
+                doubleArrayOf(1.0, 1.0, 1.0, 1.0),
+            )
+        assertNull(
+            GnssPositionSolver.solve(
+                aZeroWeight,
+                doubleArrayOf(1.0, 1.0, 1.0, 1.0),
+                doubleArrayOf(1.0, 1.0, 1.0, 0.0),
+                accuracy = GnssPositionSolver.Accuracy.MEDIUM,
+            ),
+        )
+    }
 }

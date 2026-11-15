@@ -3,6 +3,46 @@ package app.simt.gnss.core.model
 import app.simt.gnss.core.utils.GnssMathUtils
 
 /**
+ * Explicit GNSS carrier signal band classification.
+ */
+enum class GnssSignalBand {
+    L1_E1_B1C,
+    B1I,
+    B3I,
+    L2,
+    E5B_B2I,
+    L5_E5A_B2A,
+    UNKNOWN,
+    ;
+
+    val isUpperBand: Boolean
+        get() = this == L1_E1_B1C || this == B1I
+
+    val isLowerBand: Boolean
+        get() = this == L5_E5A_B2A || this == E5B_B2I || this == L2 || this == B3I
+
+    companion object {
+        fun fromFrequencyHz(
+            freqHz: Double,
+            constellationType: Int = Constellation.UNKNOWN,
+        ): GnssSignalBand {
+            if (!freqHz.isFinite() || freqHz <= 0.0) return UNKNOWN
+            val mhz = freqHz / 1e6
+            return when {
+                mhz in 1570.0..1582.0 -> L1_E1_B1C
+                mhz in 1595.0..1615.0 && (constellationType == Constellation.GLONASS || constellationType == Constellation.UNKNOWN) -> L1_E1_B1C
+                mhz in 1555.0..1568.0 -> B1I
+                mhz in 1260.0..1278.0 -> B3I
+                mhz in 1220.0..1255.0 -> L2
+                mhz in 1195.0..1215.0 -> E5B_B2I
+                mhz in 1165.0..1190.0 -> L5_E5A_B2A
+                else -> UNKNOWN
+            }
+        }
+    }
+}
+
+/**
  * Data class representing a processed single-satellite measurement.
  */
 data class SatelliteMeasurement(
@@ -32,6 +72,7 @@ data class SatelliteMeasurement(
     val pseudorangeRateUncertaintyMetersPerSecond: Double = Double.NaN,
     /** Number of smoother epochs accumulated on this signal (`1` on unsmoothed/reset epochs). */
     val smoothingEpochs: Int = GnssMathUtils.HATCH_FILTER_MAX_SMOOTHING.toInt(),
+    val signalBand: GnssSignalBand = GnssSignalBand.fromFrequencyHz(carrierFrequencyHz, constellationType),
 )
 
 /** How a [PositionResult] was solved. */
@@ -106,6 +147,10 @@ data class SatelliteEphemeris(
     val cic: Double = 0.0,
     val cis: Double = 0.0,
     val tgd: Double = 0.0,
+    /**
+     * BeiDou TGD2 = t_B2I - t_B3I (seconds). 0 unless this record is BeiDou and TGD2 was decoded.
+     */
+    val beidouTgd2Seconds: Double = 0.0,
     /**
      * Galileo BGD(E1, E5a), seconds. 0 unless this record is Galileo and the field was decoded.
      * The F/NAV clock is referenced to this delay (OS SIS ICD §5.1.5).

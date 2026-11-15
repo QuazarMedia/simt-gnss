@@ -134,7 +134,7 @@ object GnssMathUtils {
 
     /** SBAS ionospheric grid delays (MT 26) change on the order of minutes; 300 s validity. */
     const val SBAS_IONO_GRID_STALENESS_MS = 300 * 1000L
-    const val MAX_WLS_ITERATIONS = 6
+    const val MAX_WLS_ITERATIONS = 12
     const val CONVERGENCE_THRESHOLD_METERS = 0.01
 
     /**
@@ -160,6 +160,12 @@ object GnssMathUtils {
      * on other bands are scaled by (L1_FREQUENCY_HZ / f)² since the ionospheric delay ∝ 1/f².
      */
     const val L1_FREQUENCY_HZ = 1_575_420_000.0
+    const val B1I_FREQUENCY_HZ = 1_561_098_000.0
+    const val B2I_FREQUENCY_HZ = 1_207_140_000.0
+    const val B3I_FREQUENCY_HZ = 1_268_520_000.0
+    const val E5B_FREQUENCY_HZ = 1_207_140_000.0
+    const val L5_FREQUENCY_HZ = 1_176_450_000.0
+    const val GLONASS_G1_NOMINAL_FREQUENCY_HZ = 1_602_000_000.0
     const val HORIZONTAL_ACCURACY_BASE = 0.2f
     const val HORIZONTAL_ACCURACY_FACTOR = 0.5f
     const val MIN_HORIZONTAL_ACCURACY = 0.05f
