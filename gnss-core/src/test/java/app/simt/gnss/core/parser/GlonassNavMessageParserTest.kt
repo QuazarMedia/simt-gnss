@@ -59,36 +59,43 @@ class GlonassNavMessageParserTest {
     private val tauRaw = -107_374L // ×2^-30 s; getSignMagnitude(−) → τn ≈ −1.0e-4 s
     private val tb = 36L // ×15 min Moscow time = 09:00 MSK
 
-    private fun buildString1(): ByteArray =
+    private fun buildString1(
+        tkHours: Long = 9L,
+        tkMinutes: Long = 15L,
+        tkHalfMinute: Long = 1L,
+    ): ByteArray =
         ByteArray(11).also { s ->
             putIcd(s, 84, 4, 1) // m = string 1
             putIcd(s, 78, 2, 1) // P1 (after the TWO unused bits at ICD 80-79)
-            putIcd(s, 76, 5, 11) // tk hours
-            putIcd(s, 71, 6, 15) // tk minutes
-            putIcd(s, 65, 1, 1) // tk 30 s flag
+            putIcd(s, 76, 5, tkHours) // tk hours
+            putIcd(s, 71, 6, tkMinutes) // tk minutes
+            putIcd(s, 65, 1, tkHalfMinute) // tk 30 s flag
             putIcdSignMagnitude(s, 64, 24, xnDotRaw)
             putIcdSignMagnitude(s, 40, 5, xnAccRaw)
             putIcdSignMagnitude(s, 35, 27, xnRaw)
         }
 
-    private fun buildString2(bn: Long = 0L): ByteArray =
+    private fun buildString2(
+        bn: Long = 0L,
+        tbValue: Long = tb,
+    ): ByteArray =
         ByteArray(11).also { s ->
             putIcd(s, 84, 4, 2) // m = string 2
             putIcd(s, 80, 3, bn) // Bn
             putIcd(s, 77, 1, 1) // P2
-            putIcd(s, 76, 7, tb)
+            putIcd(s, 76, 7, tbValue)
             putIcdSignMagnitude(s, 64, 24, ynDotRaw)
             putIcdSignMagnitude(s, 40, 5, ynAccRaw)
             putIcdSignMagnitude(s, 35, 27, ynRaw)
         }
 
-    private fun buildString3(): ByteArray =
+    private fun buildString3(ln: Long = 0L): ByteArray =
         ByteArray(11).also { s ->
             putIcd(s, 84, 4, 3) // m = string 3
             putIcd(s, 80, 1, 1) // P3
             putIcdSignMagnitude(s, 79, 11, gammaRaw)
             putIcd(s, 67, 2, 0) // p (2 bits, ICD 67-66)
-            putIcd(s, 65, 1, 0) // ln healthy
+            putIcd(s, 65, 1, ln) // ln health
             putIcdSignMagnitude(s, 64, 24, znDotRaw)
             putIcdSignMagnitude(s, 40, 5, znAccRaw)
             putIcdSignMagnitude(s, 35, 27, znRaw)
@@ -100,7 +107,20 @@ class GlonassNavMessageParserTest {
             putIcdSignMagnitude(s, 80, 22, tauRaw)
         }
 
-    private fun strings(bn: Long = 0L): Map<Int, ByteArray> = mapOf(1 to buildString1(), 2 to buildString2(bn), 3 to buildString3(), 4 to buildString4())
+    private fun strings(
+        bn: Long = 0L,
+        ln: Long = 0L,
+        tbValue: Long = tb,
+        tkHours: Long = 9L,
+        tkMinutes: Long = 15L,
+        tkHalfMinute: Long = 1L,
+    ): Map<Int, ByteArray> =
+        mapOf(
+            1 to buildString1(tkHours, tkMinutes, tkHalfMinute),
+            2 to buildString2(bn, tbValue),
+            3 to buildString3(ln),
+            4 to buildString4(),
+        )
 
     @Test
     fun parseGlonassEphemeris_recoversIcdPlacedReferenceValues() {
@@ -157,5 +177,44 @@ class GlonassNavMessageParserTest {
     fun parseGlonassEphemeris_missingString_returnsNull() {
         val incomplete = mapOf(1 to buildString1(), 2 to buildString2(), 3 to buildString3())
         assertNull(GlonassNavMessageParser.parseGlonassEphemeris(5, incomplete, 0.0, 18))
+    }
+
+    @Test
+    fun parseGlonassEphemeris_lnHealthFlagSet_returnsNull() {
+        // String 3 l_n = 1 indicates malfunction on GLONASS-M/K even when B_n = 0.
+        assertNull(
+            GlonassNavMessageParser.parseGlonassEphemeris(
+                svid = 5,
+                strings = strings(bn = 0L, ln = 1L),
+                gpsTimeOfWeekSeconds = 2 * 86400.0 + 22_000.0,
+                leapSeconds = 18,
+            ),
+        )
+    }
+
+    @Test
+    fun parseGlonassEphemeris_crossFrameTkTbMismatch_returnsNull() {
+        // String 1 tk = 01:00:00 vs String 2 tb = 13 (03:15 MSK): |tk - tb| = 2h15m > 30 min.
+        assertNull(
+            GlonassNavMessageParser.parseGlonassEphemeris(
+                svid = 5,
+                strings = strings(tbValue = 13L, tkHours = 1L, tkMinutes = 0L, tkHalfMinute = 0L),
+                gpsTimeOfWeekSeconds = 2 * 86400.0 + 3_600.0,
+                leapSeconds = 18,
+            ),
+        )
+    }
+
+    @Test
+    fun parseGlonassEphemeris_midnightWrapTkTbCoherent_succeeds() {
+        // String 1 tk = 23:55:00 MSK vs String 2 tb = 0 (00:00 MSK): wrapped |tk - tb| = 5 min <= 30 min.
+        val eph =
+            GlonassNavMessageParser.parseGlonassEphemeris(
+                svid = 5,
+                strings = strings(tbValue = 0L, tkHours = 23L, tkMinutes = 55L, tkHalfMinute = 0L),
+                gpsTimeOfWeekSeconds = 2 * 86400.0 + 75_600.0,
+                leapSeconds = 18,
+            )
+        assertNotNull(eph)
     }
 }

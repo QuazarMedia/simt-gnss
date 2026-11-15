@@ -26,7 +26,7 @@
 |----|------|------|---------|-------|-------|----------|
 | 1 | L | kalman-smoothing | - | Delayed-state 9D TDCP-Kalman fusion, per-signal smoother clock steps, Hatch gap reset & smoothing-aware code sigma | Complete | 5220bfe69a6aa027d1e34bc40aa5a52207ca029a · test: ./gradlew :gnss-core:test :gnss-android:test |
 | 2 | L | signal-wls | 1 | Explicit multi-band IF pairing & sigma scaling, BeiDou `TGD1`/`TGD2` group delays, single-SV constellation pruning & cold-start WLS convergence | Complete | 79833af50fe386a91f7eabdfec78d6d546092e98 · test: ./gradlew :gnss-core:test :gnss-android:test |
-| 3 | M | nav-timescale | - | Pilot `STATE_TOW_KNOWN` / `STATE_MSEC_AMBIGUOUS` gating, `GPS_EPOCH_UNIX_SECONDS` fallback, GLONASS frame/`l_n` validation & RINEX `toc`/week-age fixes | Queued | |
+| 3 | M | nav-timescale | - | Pilot `STATE_TOW_KNOWN` / `STATE_MSEC_AMBIGUOUS` gating, `GPS_EPOCH_UNIX_SECONDS` fallback, GLONASS frame/`l_n` validation & RINEX `toc`/week-age fixes | Complete | 945e184e241b40adb23e107b94ca12306eb9a47c · test: ./gradlew :gnss-core:test :gnss-android:test |
 | 4 | L | ssr-ppp | 2, 3 | Apply SSR code biases (`1059`/`1065`/`1242`/`1260`), fix BeiDou/GLONASS SSR IOD & BDT timing, and decode split SSR + IGS `4076` | Queued | |
 | 5 | L | rtk-core | 1 | RTK 50 km baseline cap, differential tropo/iono, float-covariance prior gating, DD pivot transform, MSM lock-time slips & `referenceStationId` | Queued | |
 | 6 | M | engine-facade | 1, 2, 3, 4, 5 | Add `SimtGnssEngine.resetSession()`, sync RTK/Kalman transitions & RTK Doppler velocity/bearing output | Queued | |
