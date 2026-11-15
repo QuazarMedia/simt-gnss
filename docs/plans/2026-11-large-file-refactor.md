@@ -21,16 +21,18 @@ gating-logic changes (review-hardened code).
 
 | id | lane | depends | title | state | evidence |
 |----|------|---------|-------|-------|----------|
-| 1 | processor-split | - | Split `GnssMeasurementProcessor.kt` (3,851 lines) into cohesive internal files | Todo | |
-| 2 | rtk-split | 1 | Split `RtkDoubleDifferenceSolver.kt` (1,062 lines) into cohesive files | Todo | |
-| 3 | test-split | 1 | Split `GnssMeasurementProcessorTest.kt` (2,506 lines) into per-area test files | Todo | |
+| r1 | processor-split | - | Split `GnssMeasurementProcessor.kt` (3,851 lines) into cohesive internal files | Queued | |
+| r2 | rtk-split | r1 | Split `RtkDoubleDifferenceSolver.kt` (1,062 lines) into cohesive files | Queued | |
+| r3 | test-split | r1 | Split `GnssMeasurementProcessorTest.kt` (2,506 lines) into per-area test files | Queued | |
 
-Companion slice in `simt-app` (own tracker, `simt-app/docs/plans/2026-11-large-file-refactor.md`):
-split `feature/gnss/.../data/location/GnssLocationServiceImpl.kt` (1,869 lines).
+Slice ids are letter-prefixed (`r1`…) so they do not collide with the completed
+remediation plan's `1`–`6` in `simt slice start`. Companion single slice in
+`simt-app` (no plan file: fewer than 3 slices): split
+`feature/gnss/.../data/location/GnssLocationServiceImpl.kt` (1,869 lines).
 
 ---
 
-## Slice 1 — `GnssMeasurementProcessor.kt` (3,851 lines)
+## Slice r1 — `GnssMeasurementProcessor.kt` (3,851 lines)
 
 - **Module:** `:gnss-android`
 - **Changes:** extract cohesive internal collaborators out of the processor
@@ -43,7 +45,7 @@ split `feature/gnss/.../data/location/GnssLocationServiceImpl.kt` (1,869 lines).
   - `GnssMeasurementProcessor.kt` under 1000 lines; no new file over 1000.
   - `git grep -c "fun computePosition\|fun processMeasurements\|fun processNavigationMessage" gnss-android/src/main` — public entry points unchanged.
 
-## Slice 2 — `RtkDoubleDifferenceSolver.kt` (1,062 lines)
+## Slice r2 — `RtkDoubleDifferenceSolver.kt` (1,062 lines)
 
 - **Module:** `:gnss-core`
 - **Changes:** extract cohesive helpers (DD observable formation, float solution,
@@ -54,7 +56,7 @@ split `feature/gnss/.../data/location/GnssLocationServiceImpl.kt` (1,869 lines).
     `RtkAmbiguityMemoryTest`).
   - No file over 1000 lines; public signatures unchanged.
 
-## Slice 3 — `GnssMeasurementProcessorTest.kt` (2,506 lines)
+## Slice r3 — `GnssMeasurementProcessorTest.kt` (2,506 lines)
 
 - **Module:** `:gnss-android` (test source set)
 - **Changes:** split into per-area test classes in the same package (raw-epoch
