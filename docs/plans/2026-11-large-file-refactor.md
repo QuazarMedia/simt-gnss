@@ -22,7 +22,7 @@ gating-logic changes (review-hardened code).
 | id | lane | depends | title | state | evidence |
 |----|------|---------|-------|-------|----------|
 | r1 | processor-split | - | Split `GnssMeasurementProcessor.kt` (3,851 lines) into cohesive internal files | Complete | d480115dd6d209338131b7078ea70defab43ee3c |
-| r2 | rtk-split | r1 | Split `RtkDoubleDifferenceSolver.kt` (1,062 lines) into cohesive files | Queued | |
+| r2 | rtk-split | r1 | Split `RtkDoubleDifferenceSolver.kt` (1,062 lines) into cohesive files | Complete | 2260fb105531383b8f978de31eaf27a230526e7d |
 | r3 | test-split | r1 | Split `GnssMeasurementProcessorTest.kt` (2,506 lines) into per-area test files | Queued | |
 
 Slice ids are letter-prefixed (`r1`…) so they do not collide with the completed
