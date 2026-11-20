@@ -1,0 +1,21 @@
+# Written by simt-dev when this repo was adopted. Yours from here: simt
+# creates this file once and never rewrites it, so your own cadence, ignore rules
+# and groups stay yours.
+#
+# Each entry is a package manager this repo actually has a manifest for, so every
+# one of them opens pull requests. Adding a manifest does not add an entry - the
+# file is yours now, and the entry is a line you write on purpose.
+#
+# To add one: copy any block below, set `package-ecosystem` to your package manager,
+# point `directory` at the folder holding the manifest, and leave the schedule at
+# weekly unless you have a reason not to.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"

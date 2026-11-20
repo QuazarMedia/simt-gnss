@@ -1,0 +1,146 @@
+# Written by simt-dev when this repo was adopted. Yours from here: simt
+# creates this file once and never rewrites it, so your own jobs and triggers stay
+# yours.
+#
+# It runs one command, `simt check` - the same gate the pre-commit hook runs,
+# in the place a pull request is actually merged. A hook guards one developer's
+# machine; this guards the merge.
+#
+# If simt cannot be found the job FAILS instead of passing. A green tick from a
+# check that never ran is the one outcome worse than a red one.
+name: simt check
+
+# Pull requests only, and that is a decision rather than a default.
+#
+# A gate that runs on every push re-runs itself for every commit that pushes a
+# branch forward, including the ones nobody asked it about, and its verdict has to
+# be cleared before the next one lands. `pull_request` asks one question — may this
+# merge — and answers it once. `main` here is the branch protection list, not a
+# trigger: the gate that has to pass is the one the pull request runs, and the one
+# on `main` is whatever CI the repository already has there.
+on:
+  pull_request:
+
+# Read-only is enough to check a repo, and a gate job does not need to write to it.
+permissions:
+  contents: read
+
+concurrency:
+  group: simt-dev-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: simt check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: install the pinned gate binary
+        # No node_modules to pin in, so the release binary into the repository:
+        # the same bytes the machine remedy names, checked against the
+        # checksum published beside it before anything runs them.
+        run: |
+          set -eu
+          os=$(uname -s | tr A-Z a-z)
+          arch=$(uname -m | sed "s/x86_64/x64/")
+          asset="simt-dev-0.11.0-$os-$arch"
+          base="https://github.com/QuazarMedia/simt-dev/releases/download/v0.11.0"
+          curl -fsSL "$base/$asset" -o "$asset"
+          expected=$(curl -fsSL "$base/$asset.sha256" | awk '{print $1}')
+          actual=$(openssl sha256 "$asset" | grep -oE '[0-9a-f]{64}')
+          if [ "$expected" != "$actual" ]; then
+            echo "checksum mismatch for $asset: the release asset does not match its published sha256" >&2
+            exit 1
+          fi
+          mkdir -p .simt/bin
+          mv "$asset" .simt/bin/simt
+          chmod +x .simt/bin/simt
+      - name: simt check
+        run: |
+          set -eu
+          ROOT="${GITHUB_WORKSPACE}"
+          # $SIMT_DEV_BIN must name ONE program: an executable on PATH, or a .mjs entry
+          # point to hand to node. It cannot be a command line, because there is no safe way
+          # to split one in sh without eval, and a value with a space that names no file is
+          # refused rather than half-executed - running from a source checkout is normal for
+          # anyone working on this project itself, so this path has to work with no install step.
+          #
+          # Every .mjs entry point goes through run_node, which checks for node first: a GUI
+          # client's PATH often carries none (nvm is sourced only in an interactive shell), and
+          # exec node there fails with 127 and no explanation of what to install.
+          run_node() {
+            if ! command -v node >/dev/null 2>&1; then
+              echo "simt: cannot find node to run $1." >&2
+              echo "  the hook runs a .mjs entry point through node; install Node >= 22.20.0," >&2
+              echo "  or set SIMT_DEV_BIN to an executable simt" >&2
+              exit 1
+            fi
+            entry="$1"
+            shift
+            exec node "$entry" "$@"
+          }
+
+          run_simt_dev() {
+            case "$1" in
+              *' '*)
+                # A space is ambiguous as text and unambiguous as a file: a value that names
+                # something on disk is a path in a directory with a space, and runs as one.
+                if [ -f "$1" ]; then
+                  case "$1" in
+                    *.mjs)
+                      run_node "$@"
+                      ;;
+                    *)
+                      exec "$@"
+                      ;;
+                  esac
+                fi
+                echo "simt: $SIMT_DEV_BIN names a command line, not a program." >&2
+                echo "  set it to a single executable or a .mjs path, e.g." >&2
+                echo "    SIMT_DEV_BIN=/path/to/checkout/bin/simt.mjs" >&2
+                exit 1
+                ;;
+              *.mjs)
+                run_node "$@"
+                ;;
+              *)
+                exec "$1" "$@"
+                ;;
+            esac
+          }
+
+          if [ -n "${SIMT_DEV_BIN:-}" ]; then
+            run_simt_dev "$SIMT_DEV_BIN" check --root "$ROOT"
+          fi
+
+          if [ -f "$ROOT/node_modules/simt-dev/bin/simt.mjs" ]; then
+            run_node "$ROOT/node_modules/simt-dev/bin/simt.mjs" check --root "$ROOT"
+          fi
+
+          # The binary this repository downloaded for itself: the pinned bytes, no node.
+          # It is checked before PATH so a repository's own copy wins over whatever a
+          # machine happens to have installed, the same way node_modules wins - and the
+          # dispatcher still compares the version it runs against the pin, so a stale
+          # copy is refused rather than trusted.
+          if [ -x "$ROOT/.simt/bin/simt" ]; then
+            exec "$ROOT/.simt/bin/simt" check --root "$ROOT"
+          fi
+
+          if command -v simt >/dev/null 2>&1; then
+            exec simt check --root "$ROOT"
+          fi
+
+          echo "simt: cannot locate simt." >&2
+          # Every expansion in these diagnostics must carry a default. Under `set -eu` an
+          # unbound variable aborts the shell, so an unguarded $SIMT_DEV_BIN here would
+          # kill the message that exists to explain the failure - and this block only runs
+          # when nothing resolved, which is the one moment the reader needs it.
+          echo "  looked for: ${SIMT_DEV_BIN:-<unset>}, $ROOT/node_modules/simt-dev, $ROOT/.simt/bin/simt, simt on PATH" >&2
+          # The remedy is assigned single-quoted and echoed, so a command in it - the binary
+          # download derives its platform with $(uname) - stays text here and runs only when
+          # the reader runs it. A remedy in double quotes would be half-executed by this echo.
+          remedy='REMEDY run: mkdir -p .simt/bin && os=$(uname -s | tr A-Z a-z) && arch=$(uname -m | sed "s/x86_64/x64/") && curl -fsSL "https://github.com/QuazarMedia/simt-dev/releases/download/v0.11.0/simt-dev-0.11.0-$os-$arch" -o .simt/bin/simt && chmod +x .simt/bin/simt   (the gate runs from the release binary in .simt/bin)'
+          echo "REMEDY run: mkdir -p .simt/bin && os=$(uname -s | tr A-Z a-z) && arch=$(uname -m | sed "s/x86_64/x64/") && curl -fsSL "https://github.com/QuazarMedia/simt-dev/releases/download/v0.11.0/simt-dev-0.11.0-$os-$arch" -o .simt/bin/simt && chmod +x .simt/bin/simt   (the gate runs from the release binary in .simt/bin)" >&2
+          exit 1
+

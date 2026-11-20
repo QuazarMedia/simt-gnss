@@ -366,5 +366,6 @@ misses half of the failure they exist to catch.
 ## Disclosure
 
 - gnss-engine — Navigate and extend the simt-gnss GNSS engine library (app.simt:gnss-core / app.simt:gnss-android) - pure-JVM parsers, solvers, filters, corrections and orbit computation, plus the Android GnssMeasurementProcessor and its public SimtGnssEngine facade. Use for any task mentioning GNSS, RTK, PPP, RTCM, SBAS, NTRIP, ephemeris, pseudorange, carrier phase, ionosphere/troposphere, Klobuchar, satellite constellations, or raw GnssMeasurement processing.
+- simt-commands — Command reference for simt-dev: which commands are mutating vs read-only, and a scenario-to-command mapping for the agent.
 
 <!-- simt:end -->
