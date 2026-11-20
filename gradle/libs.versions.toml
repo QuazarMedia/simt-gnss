@@ -13,7 +13,7 @@ ktlint = "1.2.1"
 
 # Test
 junit = "4.13.2"
-robolectric = "4.16.1" # Pinned: 4.17 breaks the sandbox on this toolchain.
+robolectric = "4.18" # Pinned: 4.17 breaks the sandbox on this toolchain.
 
 [libraries]
 junit = { group = "junit", name = "junit", version.ref = "junit" }
