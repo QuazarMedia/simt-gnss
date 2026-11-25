@@ -1,6 +1,6 @@
 <!-- simt:begin -->
 <!-- simt:generated -->
-<!-- simt:sha=1c8436ac0ee4ea8fa7f6387b32683fc98adbbd03 -->
+<!-- simt:sha=7497dcce13068164496a88042e8b0a668a8e9bf1 -->
 <!-- simt:sources=rules/core.md,rules/stacks/android.md,rules/stacks/jvm.md,rules/mdc/intake-questions.mdc,rules/mdc/slice-commit.mdc,rules/mdc/test-gate.mdc -->
 <!-- Generated content. Do not edit by hand - your changes are overwritten.
      Run `simt sync --yes` to regenerate, or `simt check` to see what is stale. -->
@@ -62,6 +62,12 @@ rule; follow it for every commit and push.
   reaches for `--no-verify`. (ADR-017)
 - Invoke tools through the repository's own runner — `npm run`, `uv run -m`, `./gradlew` —
   never a package runner like `npx` or a bare console entrypoint. (ADR-010)
+
+### Surfaces
+
+- Where a `simt` MCP server is installed, its tools answer the same questions as the CLI
+  commands named here — one logic with two doors, not two systems. Use whichever surface
+  your harness exposes; a result from either is the same evidence. (ADR-126)
 
 ### Code and review
 
@@ -242,32 +248,49 @@ evidence for a test you have not run.
 
 ### Commit message
 
-A message is read by the next agent before they are told what to do. It says what the
-commit is, what it answers, and what it changed, so a reader never reconstructs that
-from the diff.
+A message is read by the next agent before they are told what to do. The title says
+what changed in one line; the body carries what that line cannot — what the change
+is, why it was asked for, and what was run to prove it. A reader never reconstructs
+that from the patch.
 
 The title is Conventional Commits: imperative, no trailing period, a short scope slug
 that names the subsystem — not a ticket id.
 
     feat(dispatcher): skip the test gate on a push that already passed
 
-The body is plain sections in this order. Drop any section that has nothing to say; a
-one-line commit needs none of them.
+The body is sections in a fixed order, separated by one blank line. `What` and
+`Why` are always present; the other two appear only when they have something to say.
 
-    What: <one sentence — what this commit is>
-    Why: <what it answers — the task, defect, or decision that asked for it>
-    Before: <the state this replaces, briefly>
-    After: <the state it leaves, briefly>
+    What: <the title said out: what the change is, in one to two sentences>
 
-"Before" and "After" are a short state summary, not a diff: enough to see what moved,
-not enough to need the patch. Cite a decision record where one settles the change, and
-never claim a test in the body that was not run on this tree.
+    Why: <the task, defect, or decision that asked for this, in one to three sentences>
 
-The message ends with a trailer on its own line, after the body - attribution to the
-tool, in the form git renders as a co-author. It is part of the message, not a
-section, so it stays even when every section is dropped:
+    Delta: <before> -> <after>
 
+    Evidence: <what ran on this tree, and what it said>
+
+`What` is the title in a sentence or two — the change explained, not a file list
+recited. It is capped on purpose: one to two sentences, never a paragraph, and no
+more detail than the title asks for. `Why` is the one claim the diff cannot make.
+`Delta` states a change the patch does not show by itself — skipped work, scheduling,
+wire format — as one line with an ASCII arrow, never a paragraph. `Evidence` names
+the commands that ran and their result; it is the fixed shape that makes "never
+claim a test you did not run" checkable, and it appears only when something ran.
+
+The state before the change is not a section of its own: `Delta` carries the
+before -> arrow, and the diff is the before written down. A section that recites
+what the tree already shows spends words on what the patch will show anyway.
+
+The message ends with a trailer block, the last paragraph after one blank line:
+decision and task ids on a `Refs:` line when a record settles the change, then the
+attribution in the form git renders as a co-author. Trailers are the part of a message
+with a grammar, so the ids sit where `git log --grep` finds them:
+
+    Refs: ADR-120
     Co-Authored-By: Simt Dev <noreply@simt.space>
+
+The attribution stays even when every section is dropped. Labels and trailers are
+ASCII; wrap at 72 columns.
 
 ### Order
 
@@ -279,7 +302,7 @@ section, so it stays even when every section is dropped:
 3. **Read the staged diff.** Not the working tree — the diff. It is what will be
    committed, and it is the last chance to notice a file that does not belong.
 4. **Write the message in the format above.** The title names what changed; the body
-   says why, and what was deliberately not changed.
+   carries what the diff cannot, and omits what it already shows.
 5. **Commit.** `git commit`, non-interactive. Report the SHA.
 6. **Stop.**
 
@@ -312,13 +335,17 @@ A worktree is the unit of isolation for concurrent work. The rules that keep it 
 - **Start from the record, not from memory.** `simt slice start <id>` creates the
   worktree for the tracker row and returns its path; work in that path, not the main
   checkout.
-- **Finish where you started.** `simt slice finish <id>` runs the declared gates and
-  commits from the worktree; `simt plan done <id> <sha>` records the SHA in the main
-  checkout's tracker. A slice is not done when its worktree is green — it is done
-  when the tracker row is complete and the SHA is recorded.
-- **Leave the worktree when the slice is done.** A finished worktree that still holds
-  a dirty tree is a claim about work that is not committed; remove it, and report what
-  you left behind if there was any.
+- **Finish from the main checkout.** `simt slice finish <id>` runs the declared gates
+  and commits the staged work on the slice branch — or, when nothing is staged, lands
+  the commit already on its branch — records the SHA in the main checkout's tracker,
+  merges the branch into the main checkout, and removes the worktree and its branch
+  (ADR-209, ADR-210). It refuses when run inside the worktree, because a worktree cannot
+  delete the directory that shell is standing in. A slice is not done when its worktree
+  is green — it is done when that one command has merged it.
+- **A kept worktree is a failure to report.** `finish` removes a worktree only when it
+  can do so without discarding untracked work. A kept worktree and branch are named in
+  its output; remove them once their contents are accounted for, and report what was
+  left behind.
 - **Never rewrite history across worktrees.** A rebase, reset or amend in one worktree
   changes the base every other worktree branched from; coordinate it, or do not do it.
 

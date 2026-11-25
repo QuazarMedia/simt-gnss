@@ -1,6 +1,6 @@
 ---
 name: simt-commands
-description: Command reference for simt-dev: which commands are mutating vs read-only, and a scenario-to-command mapping for the agent.
+description: "Command reference for simt-dev: which commands are mutating vs read-only, and a scenario-to-command mapping for the agent."
 ---
 
 ## Dry run
@@ -14,21 +14,21 @@ add `--yes` and hope.
 ### Mutating commands (need `--yes` to write)
 
 `init`, `sync`, `plan done`, `slice start`, `slice finish`, `slice abandon`,
-`agents install`, `agent-hooks install`, `hooks install`, `doctor --fix`,
-`ignore`, `ci`, `shared install`, `lessons review`, `decide`, `undo`,
-`skills install`, `bench mine|run|ablate|probes|variants`, `pack new|publish`,
+`agents install`, `agent-hooks install`, `hooks install`, `mcp install`, `doctor --fix`,
+`ignore`, `shared install`, `lessons review`, `decide`, `undo`,
+`skills install`, `bench mine|run|ablate|probes`, `pack new|publish`,
 `lease`, `plugin <harness>`, `workspace upgrade`
 
 ### Read-only commands (no flag needed)
 
-`brief`, `why`, `tests`, `gate`, `impact`, `map`, `check`, `status`,
+`brief`, `why`, `tests`, `gate`, `impact`, `map`, `check`, `status`, `studio`,
 `plan status|next`, `rules *`, `agents status`, `agent-hooks status`,
 `hooks status`, `evidence`, `evidence check`, `evidence validate`,
 `pr-body`, `explain`, `graph lint`,
 `skills index|brief|show|why|find|compile|eval`, `index`, `index overlay`,
 `review`, `tokens`, `harness *`, `compare`, `workspace compare|share`,
 `distill`, `docs readme`, `local doctor`, `shared plan`,
-`bench report|critic`, `pack lint`, `mcp`, `completions`,
+`bench report|critic`, `pack lint`, `mcp`, `mcp status`, `completions`,
 `lessons list|capture|discover`, `knowledge *`, `work *`, `verify *`,
 `action status|review`, `adapter check`
 
@@ -64,6 +64,8 @@ Pick the command by what you need, not by what you remember:
 | Install hooks | `simt hooks install --yes` | Shared dispatcher; `--agent` writes each harness hooks file |
 | Run a hook event | `simt hooks run <event>` | As git would |
 | Install agent hooks | `simt agent-hooks install --yes` | Per-harness policies |
+| See which MCP servers are configured | `simt mcp status` | Entry-level file facts; an acceptance is never claimed |
+| Write registry servers into harness configs | `simt mcp install --yes` | Preview without `--yes`; an unreadable config refuses the run, and no other harness is written |
 | Diagnose config | `simt doctor [--fix]` | `--fix` applies safe remedies |
 | Pin a skill | `simt skills install <name> --yes` | `--variant` for multi-variant |
 | Search skills | `simt skills find <query>` | Capability and keyword |
@@ -75,14 +77,14 @@ Pick the command by what you need, not by what you remember:
 | Claim files for a session | `simt lease [<paths>...] --yes` | TTL; pre-edit hook refuses |
 | Measure token cost | `simt tokens` | Bytes a reader loads at session start |
 | Snapshot the repository | `simt status` | `--line` prints the last check's line |
+| Open the local dashboard | `simt studio` | Loopback only; Ctrl-C stops it and nothing is written |
 | Check what a commit claims | `simt evidence check <msg-file>` | A run this tree does not have |
 | Compare sibling repositories | `simt compare` | Adoption and drift matrix |
 | Check local model endpoints | `simt local doctor` | `--allow-remote` to probe |
 | See what a shared install would write | `simt shared plan` | `shared install --yes` writes it |
-| Render the README command list | `simt docs readme` | From the spec; `--yes` writes it |
+| Render the command reference | `simt docs commands --yes` | docs/commands from the spec |
 | Compile a skill | `simt skills compile [<name>]` | Agent Skills standard |
 | Score the registry | `simt skills eval [corpus]` | Against recorded transcripts |
-| Refresh the workflows | `simt ci` | This package's own `.github` |
 
 ## Doors (JSON in, facts out)
 
